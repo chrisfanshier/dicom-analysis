@@ -10,14 +10,19 @@ from tkinter import filedialog, messagebox, ttk
 import numpy as np
 from PIL import Image, ImageTk
 
+from core_stitch.analyze import LINER_PRESETS
 from core_stitch.export import export_accept
 from core_stitch.overlap import FUSE_MODES
 from core_stitch.pipeline import (
     StitchState,
+    build_sediment_volume_mask,
     coarse_align,
+    detect_sediment_roi,
     ensure_posed,
     masked_hu_values,
     preview_arrays,
+    preview_xz_arrays,
+    rebuild_sediment_mask_2d,
     recompute_overlap,
     refine_join,
     set_auto_window,
@@ -78,14 +83,29 @@ class StitchGui(tk.Tk):
         self.export_dicom = tk.BooleanVar(value=True)
         self.export_npy = tk.BooleanVar(value=True)
         self.export_json = tk.BooleanVar(value=True)
+        self.export_sediment_mask = tk.BooleanVar(value=False)
+        self.export_sediment_roi = tk.BooleanVar(value=False)
+        self.show_sediment = tk.BooleanVar(value=True)
+        self.sed_erode = tk.DoubleVar(value=0.0)
+        self.sed_nudge_x = tk.DoubleVar(value=0.0)
+        self.sed_nudge_z = tk.DoubleVar(value=0.0)
+        self.sed_label = tk.StringVar(value="Sediment ROI: not detected")
+        self.liner_preset = tk.StringVar(value="Auto (no prior)")
+        self.liner_od = tk.DoubleVar(value=70.0)
+        self.liner_wall = tk.DoubleVar(value=3.0)
+        self.xz_y_frac = tk.DoubleVar(value=0.5)
+        self.xz_label = tk.StringVar(value="XZ: align first")
         self.win_lo = tk.DoubleVar(value=0.0)
         self.win_hi = tk.DoubleVar(value=1.0)
         self.win_label = tk.StringVar(value="Window: —")
         self._z_job: str | None = None
         self._win_job: str | None = None
+        self._sed_job: str | None = None
+        self._xz_job: str | None = None
         self._hist_range: tuple[float, float] = (0.0, 1.0)
         self._hist_counts: np.ndarray | None = None
         self._hist_edges: np.ndarray | None = None
+        self._photo_xz: ImageTk.PhotoImage | None = None
 
         self._pan_start: tuple[int, int] | None = None
         self._build()
@@ -116,24 +136,28 @@ class StitchGui(tk.Tk):
         nb.grid(row=1, column=0, sticky="nsew")
         tab_align = ttk.Frame(nb, padding=8)
         tab_display = ttk.Frame(nb, padding=8)
+        tab_analyze = ttk.Frame(nb, padding=8)
         tab_export = ttk.Frame(nb, padding=8)
         nb.add(tab_align, text="Align")
         nb.add(tab_display, text="Display")
+        nb.add(tab_analyze, text="Analyze")
         nb.add(tab_export, text="Export")
         self._notebook = nb
 
         self._build_align_tab(tab_align)
         self._build_display_tab(tab_display)
+        self._build_analyze_tab(tab_analyze)
         self._build_export_tab(tab_export)
 
         ttk.Label(left, textvariable=self.status, wraplength=340).grid(
             row=2, column=0, sticky="ew", pady=(8, 0)
         )
 
-        # ----- Right image pane -----
+        # ----- Right image pane (coronal + compact XZ) -----
         canvas_frame = ttk.Frame(root, padding=(4, 8, 8, 8))
         canvas_frame.grid(row=0, column=1, sticky="nsew")
         canvas_frame.rowconfigure(0, weight=1)
+        canvas_frame.rowconfigure(2, weight=0)
         canvas_frame.columnconfigure(0, weight=1)
 
         self.canvas = tk.Canvas(canvas_frame, background="#111", highlightthickness=0)
@@ -150,7 +174,32 @@ class StitchGui(tk.Tk):
         self.vbar.grid(row=0, column=1, sticky="ns")
         self.hbar.grid(row=1, column=0, sticky="ew")
 
+        self.xz_frame = ttk.LabelFrame(
+            canvas_frame, text="XZ cross-section (sediment cylinder)", padding=4
+        )
+        self.xz_frame.grid(row=2, column=0, columnspan=2, sticky="ew", pady=(6, 0))
+        self.xz_frame.columnconfigure(0, weight=1)
+        ttk.Label(self.xz_frame, textvariable=self.xz_label, font=("", 8)).grid(
+            row=0, column=0, sticky="w"
+        )
+        self.xz_canvas = tk.Canvas(
+            self.xz_frame, background="#111", highlightthickness=0, height=160
+        )
+        self.xz_canvas.grid(row=1, column=0, sticky="ew", pady=(2, 0))
+        yrow = ttk.Frame(self.xz_frame)
+        yrow.grid(row=2, column=0, sticky="ew", pady=(4, 0))
+        ttk.Label(yrow, text="Y cut", font=("", 8)).pack(side=tk.LEFT)
+        ttk.Scale(
+            yrow,
+            from_=0.05,
+            to=0.95,
+            variable=self.xz_y_frac,
+            command=self._on_xz_y_slide,
+        ).pack(side=tk.LEFT, fill=tk.X, expand=True, padx=6)
+        ttk.Label(yrow, text="← top · btm →", font=("", 8)).pack(side=tk.LEFT)
+
         self.canvas.bind("<Configure>", lambda _e: self._schedule_refresh())
+        self.xz_canvas.bind("<Configure>", lambda _e: self._schedule_refresh())
         self.canvas.bind("<MouseWheel>", self._on_mousewheel)
         self.canvas.bind("<Button-4>", lambda e: self._on_mousewheel_linux(e, 1))
         self.canvas.bind("<Button-5>", lambda e: self._on_mousewheel_linux(e, -1))
@@ -370,14 +419,112 @@ class StitchGui(tk.Tk):
         )
         ttk.Label(win, textvariable=self.win_label).pack(anchor=tk.W)
 
+    def _build_analyze_tab(self, parent: ttk.Frame) -> None:
+        parent.columnconfigure(0, weight=1)
+        ttk.Label(
+            parent,
+            text="Whole-core sediment ROI: outside-in liner/void peel (optional).",
+            wraplength=320,
+        ).pack(anchor=tk.W)
+
+        liner = ttk.LabelFrame(parent, text="Liner prior (optional)", padding=6)
+        liner.pack(fill=tk.X, pady=(10, 0))
+        self.liner_combo = ttk.Combobox(
+            liner,
+            textvariable=self.liner_preset,
+            values=list(LINER_PRESETS.keys()),
+            state="readonly",
+            width=28,
+        )
+        self.liner_combo.pack(fill=tk.X)
+        self.liner_combo.bind("<<ComboboxSelected>>", lambda _e: self._on_liner_preset())
+        lr = ttk.Frame(liner)
+        lr.pack(fill=tk.X, pady=(6, 0))
+        ttk.Label(lr, text="OD mm").pack(side=tk.LEFT)
+        ttk.Spinbox(
+            lr, from_=20, to=200, increment=0.5, textvariable=self.liner_od, width=7
+        ).pack(side=tk.LEFT, padx=(4, 10))
+        ttk.Label(lr, text="Wall mm").pack(side=tk.LEFT)
+        ttk.Spinbox(
+            lr, from_=0.5, to=20, increment=0.1, textvariable=self.liner_wall, width=6
+        ).pack(side=tk.LEFT, padx=(4, 0))
+        ttk.Label(
+            liner,
+            text="Guides outer search; leave Auto if unknown.",
+            font=("", 8),
+        ).pack(anchor=tk.W, pady=(4, 0))
+
+        ttk.Button(
+            parent, text="Auto sediment (outside→in)", command=self._run_sediment
+        ).pack(fill=tk.X, pady=(10, 4))
+        ttk.Checkbutton(
+            parent,
+            text="Show sediment overlay",
+            variable=self.show_sediment,
+            command=self._on_show_sediment,
+        ).pack(anchor=tk.W)
+        ttk.Label(parent, textvariable=self.sed_label, wraplength=320).pack(
+            anchor=tk.W, pady=(6, 0)
+        )
+
+        er = ttk.LabelFrame(parent, text="Erode inward (mm)", padding=6)
+        er.pack(fill=tk.X, pady=(10, 0))
+        ttk.Scale(
+            er,
+            from_=0.0,
+            to=50.0,
+            variable=self.sed_erode,
+            command=self._on_sediment_adjust,
+        ).pack(fill=tk.X)
+        ttk.Label(
+            er, text="Shrink after auto detect (0–50 mm)", font=("", 8)
+        ).pack(anchor=tk.W)
+
+        nd = ttk.LabelFrame(parent, text="Center nudge (mm)", padding=6)
+        nd.pack(fill=tk.X, pady=(10, 0))
+        ttk.Label(nd, text="ΔX (lateral)").pack(anchor=tk.W)
+        ttk.Scale(
+            nd,
+            from_=-10.0,
+            to=10.0,
+            variable=self.sed_nudge_x,
+            command=self._on_sediment_adjust,
+        ).pack(fill=tk.X)
+        ttk.Label(nd, text="ΔZ (through stack)").pack(anchor=tk.W, pady=(4, 0))
+        ttk.Scale(
+            nd,
+            from_=-10.0,
+            to=10.0,
+            variable=self.sed_nudge_z,
+            command=self._on_sediment_adjust,
+        ).pack(fill=tk.X)
+        ttk.Button(nd, text="Reset nudge", command=self._reset_sediment_nudge).pack(
+            anchor=tk.W, pady=(6, 0)
+        )
+
+        ttk.Button(
+            parent,
+            text="Apply to all Z (build 3D mask)",
+            command=self._sediment_all_z,
+        ).pack(fill=tk.X, pady=(14, 0))
+        ttk.Label(
+            parent,
+            text="Export can run with or without Analyze. "
+            "3D mask file is written only after Apply to all Z.",
+            wraplength=320,
+            font=("", 8),
+        ).pack(anchor=tk.W, pady=(8, 0))
+
     def _build_export_tab(self, parent: ttk.Frame) -> None:
         parent.columnconfigure(0, weight=1)
         ttk.Label(
             parent,
-            text="JPEG/TIFF 8-bit use the greyscale window from Display.",
+            text="Stitch exports work anytime after Align. "
+            "Sediment extras need Analyze.",
             wraplength=320,
         ).pack(anchor=tk.W, pady=(0, 8))
 
+        ttk.Label(parent, text="Stitch products", font=("", 9, "bold")).pack(anchor=tk.W)
         ttk.Checkbutton(
             parent, text="JPEG (windowed 8-bit)", variable=self.export_jpeg
         ).pack(anchor=tk.W)
@@ -395,6 +542,20 @@ class StitchGui(tk.Tk):
         ttk.Checkbutton(parent, text="JSON sidecar", variable=self.export_json).pack(
             anchor=tk.W, pady=(4, 0)
         )
+
+        ttk.Label(parent, text="Sediment (Analyze)", font=("", 9, "bold")).pack(
+            anchor=tk.W, pady=(12, 0)
+        )
+        ttk.Checkbutton(
+            parent,
+            text="Sediment mask (TIFF + NPY)",
+            variable=self.export_sediment_mask,
+        ).pack(anchor=tk.W)
+        ttk.Checkbutton(
+            parent,
+            text="Sediment ROI image (clipped 2D)",
+            variable=self.export_sediment_roi,
+        ).pack(anchor=tk.W, pady=(4, 0))
 
         ttk.Button(parent, text="Export selected…", command=self.accept_export).pack(
             fill=tk.X, pady=(16, 0)
@@ -452,6 +613,12 @@ class StitchGui(tk.Tk):
         self.roll_var.set(0.0)
         self.fuse_mode.set(self.state.fuse_mode)
         self.match_hu_var.set(self.state.match_hu)
+        self.sed_erode.set(0.0)
+        self.sed_nudge_x.set(0.0)
+        self.sed_nudge_z.set(0.0)
+        self.export_sediment_mask.set(False)
+        self.export_sediment_roi.set(False)
+        self._sync_sediment_label()
         self._sync_nudge_vars()
         # Widen nudge range from core length
         extent = max(
@@ -484,6 +651,8 @@ class StitchGui(tk.Tk):
             )
         self._auto_window()
         self._schedule_refresh()
+        # XZ needs the posed stack; build after layout has a real width
+        self.after(200, self._refresh_xz)
 
     def _init_z_browser(self) -> None:
         if self.state is None:
@@ -810,6 +979,107 @@ class StitchGui(tk.Tk):
             self.win_hi.set(max(hu, float(self.win_lo.get()) + 1.0))
         self._apply_window()
 
+    def _sync_sediment_label(self) -> None:
+        if self.state is None or self.state.sediment is None:
+            self.sed_label.set("Sediment ROI: not detected")
+            return
+        s = self.state.sediment
+        liner = f"{s.liner_hu:.0f}" if s.liner_hu is not None else "?"
+        void = f"{s.void_hu:.0f}" if s.void_hu is not None else "?"
+        z3 = " · 3D ready" if s.mask_3d is not None else ""
+        self.sed_label.set(
+            f"R={s.effective_radius_mm:.1f} mm (auto {s.radius_mm:.1f} − erode "
+            f"{s.erode_mm:.1f}) · liner≈{liner} void≈{void} HU · {s.note}{z3}"
+        )
+
+    def _on_liner_preset(self) -> None:
+        key = str(self.liner_preset.get())
+        od, wall = LINER_PRESETS.get(key, (None, None))
+        if od is not None:
+            self.liner_od.set(float(od))
+        if wall is not None:
+            self.liner_wall.set(float(wall))
+
+    def _liner_prior_args(self) -> tuple[float | None, float | None]:
+        key = str(self.liner_preset.get())
+        if key.startswith("Auto"):
+            return None, None
+        try:
+            return float(self.liner_od.get()), float(self.liner_wall.get())
+        except (TypeError, ValueError, tk.TclError):
+            return None, None
+
+    def _run_sediment(self) -> None:
+        if self.state is None:
+            messagebox.showinfo("Analyze", "Run coarse align first.")
+            return
+        od, wall = self._liner_prior_args()
+        self.status.set("Detecting sediment ROI (outside→in)…")
+        self.update_idletasks()
+        try:
+            sed = detect_sediment_roi(
+                self.state, liner_od_mm=od, liner_wall_mm=wall
+            )
+        except Exception as exc:
+            messagebox.showerror("Analyze failed", str(exc))
+            self.status.set(f"Analyze failed: {exc}")
+            return
+        self.sed_erode.set(sed.erode_mm)
+        self.sed_nudge_x.set(sed.nudge_x_mm)
+        self.sed_nudge_z.set(sed.nudge_z_mm)
+        self.state.show_sediment = bool(self.show_sediment.get())
+        self._sync_sediment_label()
+        self.status.set(
+            f"Sediment ROI: R={sed.effective_radius_mm:.1f} mm — tweak erode/nudge as needed."
+        )
+        self._schedule_refresh()
+
+    def _on_show_sediment(self) -> None:
+        if self.state is not None:
+            self.state.show_sediment = bool(self.show_sediment.get())
+        self._schedule_refresh()
+
+    def _on_sediment_adjust(self, _value: str | None = None) -> None:
+        if self._sed_job is not None:
+            self.after_cancel(self._sed_job)
+        self._sed_job = self.after(50, self._apply_sediment_adjust)
+
+    def _apply_sediment_adjust(self) -> None:
+        self._sed_job = None
+        if self.state is None or self.state.sediment is None:
+            return
+        self.state.sediment.erode_mm = float(self.sed_erode.get())
+        self.state.sediment.nudge_x_mm = float(self.sed_nudge_x.get())
+        self.state.sediment.nudge_z_mm = float(self.sed_nudge_z.get())
+        self.state.sediment.mask_3d = None  # invalidate volume mask
+        rebuild_sediment_mask_2d(self.state)
+        self._sync_sediment_label()
+        self._schedule_refresh()
+
+    def _reset_sediment_nudge(self) -> None:
+        self.sed_nudge_x.set(0.0)
+        self.sed_nudge_z.set(0.0)
+        self._apply_sediment_adjust()
+
+    def _sediment_all_z(self) -> None:
+        if self.state is None or self.state.sediment is None:
+            messagebox.showinfo("Analyze", "Run Auto sediment first.")
+            return
+        self.status.set("Building 3D sediment mask (all Z)…")
+        self.update_idletasks()
+        try:
+            m3 = build_sediment_volume_mask(self.state)
+        except Exception as exc:
+            messagebox.showerror("3D mask failed", str(exc))
+            self.status.set(f"3D mask failed: {exc}")
+            return
+        self._sync_sediment_label()
+        self.status.set(
+            f"3D sediment mask ready: {tuple(m3.shape)} · "
+            f"{int(m3.sum())} voxels — enable mask export on Export tab."
+        )
+        self.export_sediment_mask.set(True)
+
     def accept_export(self) -> None:
         if self.state is None:
             messagebox.showinfo("Export", "Run coarse align first.")
@@ -819,8 +1089,18 @@ class StitchGui(tk.Tk):
         dicom = bool(self.export_dicom.get())
         npy = bool(self.export_npy.get())
         js = bool(self.export_json.get())
-        if not any((jpeg, tiff, dicom, npy, js)):
+        sed_m = bool(self.export_sediment_mask.get())
+        sed_r = bool(self.export_sediment_roi.get())
+        if not any((jpeg, tiff, dicom, npy, js, sed_m, sed_r)):
             messagebox.showinfo("Export", "Select at least one export type.")
+            return
+        if (sed_m or sed_r) and (
+            self.state.sediment is None or self.state.sediment.mask_2d is None
+        ):
+            messagebox.showinfo(
+                "Export",
+                "Sediment extras need Analyze → Auto sediment first.",
+            )
             return
         if self.state.low_confidence:
             if not messagebox.askyesno(
@@ -843,6 +1123,8 @@ class StitchGui(tk.Tk):
                 dicom=dicom,
                 npy=npy,
                 json_sidecar=js,
+                sediment_mask=sed_m,
+                sediment_roi_image=sed_r,
             )
         except Exception as exc:
             messagebox.showerror("Export failed", str(exc))
@@ -913,6 +1195,68 @@ class StitchGui(tk.Tk):
             self.after_cancel(self._refresh_job)
         self._refresh_job = self.after(40, self.refresh)
 
+    def _on_xz_y_slide(self, _value: str | None = None) -> None:
+        if self._xz_job is not None:
+            self.after_cancel(self._xz_job)
+        self._xz_job = self.after(80, self._refresh_xz)
+
+    def _refresh_xz(self) -> None:
+        self._xz_job = None
+        if self.state is None:
+            self.xz_label.set("XZ: run coarse align first")
+            self.xz_canvas.delete("all")
+            return
+        # Wait until the panel has a real width (first layout can be ~1 px)
+        cw = max(self.xz_canvas.winfo_width(), self.xz_frame.winfo_width() - 16)
+        ch = max(self.xz_canvas.winfo_height(), 120)
+        if cw < 40:
+            self.xz_label.set("XZ: waiting for layout…")
+            self.after(150, self._refresh_xz)
+            return
+        self.xz_label.set("XZ: building… (first time can take a few seconds)")
+        self.update_idletasks()
+        try:
+            ensure_posed(self.state)
+            if self.state.view_z is None:
+                self.state.view_z = self.state.posed.n_slices // 2  # type: ignore[union-attr]
+            arr = preview_xz_arrays(
+                self.state,
+                y_frac=float(self.xz_y_frac.get()),
+                overlay_sediment=bool(self.show_sediment.get()),
+                crop_core=True,
+                pad_mm=3.0,
+            )
+        except Exception as exc:
+            self.xz_label.set(f"XZ: {exc}")
+            return
+        if arr is None:
+            self.xz_label.set("XZ: unavailable (posed stack failed)")
+            self.xz_canvas.delete("all")
+            return
+        full = Image.fromarray(arr, mode="RGB")
+        fit = min(cw / full.width, ch / full.height)
+        disp_w = max(1, int(round(full.width * fit)))
+        disp_h = max(1, int(round(full.height * fit)))
+        im = full.resize((disp_w, disp_h), Image.Resampling.BILINEAR)
+        self._photo_xz = ImageTk.PhotoImage(im)
+        self.xz_canvas.delete("all")
+        x0 = max(0, (cw - disp_w) // 2)
+        y0 = max(0, (ch - disp_h) // 2)
+        self.xz_canvas.create_image(x0, y0, image=self._photo_xz, anchor=tk.NW)
+        z = self.state.view_z
+        sed = self.state.sediment
+        if sed is not None:
+            self.xz_label.set(
+                f"XZ · Y={float(self.xz_y_frac.get()):.0%} · "
+                f"R={sed.effective_radius_mm:.1f} mm · "
+                f"yellow=coronal Z{z} · green=cylinder"
+            )
+        else:
+            self.xz_label.set(
+                f"XZ · Y={float(self.xz_y_frac.get()):.0%} · "
+                f"yellow=coronal Z{z} · Auto sediment for circle"
+            )
+
     def refresh(self) -> None:
         self._refresh_job = None
         if self.state is None:
@@ -945,6 +1289,7 @@ class StitchGui(tk.Tk):
         self.canvas.create_image(0, 0, image=self._photo, anchor=tk.NW, tags=("img",))
         self.canvas.configure(scrollregion=(0, 0, disp_w, disp_h))
         self.zoom_label.set(f"Zoom: {int(round(zoom * 100))}%")
+        self._refresh_xz()
         # Keep histogram markers in sync when slice/fuse changes
         if self._hist_counts is not None:
             try:

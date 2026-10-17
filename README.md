@@ -24,11 +24,13 @@ core-stitch "D:\path\SE1" "D:\path\SE2"
 
 ## Flow
 
-Left rail tabs **Align** / **Display** / **Export**; image fills the right pane.
+Left rail tabs **Align** / **Display** / **Analyze** / **Export**; image fills the right pane.
 
 1. **Align** — open TOP/BTM, coarse align, Flip/Roll/nudge, Refine join  
 2. **Display** — alignment colors, slice browser, crop, zoom, overlap fuse, HU histogram window  
-3. **Export** — check products (JPEG / TIFF / DICOM / NumPy / JSON), Export selected…
+3. **Analyze** (optional) — auto sediment ROI (liner/void peel), erode, X/Z nudge, optional 3D mask  
+4. **Export** — stitch products and/or sediment mask / ROI image (Analyze not required for stitch export)  
+
 
 **B nudge:** X/Y move BTM; **Widen** only expands slider travel. Pan: middle-drag or Alt+drag. Arrows = 1 mm (Shift=5). Slice: `[` `]` or PageUp/Down.
 

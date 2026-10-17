@@ -31,6 +31,14 @@ from core_stitch.overlap import (
     search_overlap,
     upright_angle,
 )
+from core_stitch.analyze import (
+    SedimentRoi,
+    build_sediment_mask_2d,
+    build_sediment_mask_3d,
+    detect_sediment_from_profile,
+    overlay_sediment_circle_xz,
+    overlay_sediment_rgb,
+)
 from core_stitch.refine import RefineResult, _shift_stack_z, refine_join_volumes
 from core_stitch.segment import mid_slice, segment_core
 
@@ -87,6 +95,12 @@ class StitchState:
     canvas_b: np.ndarray | None = None
     mask_a: np.ndarray | None = None
     mask_b: np.ndarray | None = None
+    sediment: SedimentRoi | None = None
+    show_sediment: bool = True
+    # Cached fused XZ plane for compact QC panel: key, HU (Z,W), mask (Z,W)
+    _xz_cache_key: tuple | None = None
+    _xz_hu: np.ndarray | None = None
+    _xz_mask: np.ndarray | None = None
     warnings: list[str] = field(default_factory=list)
 
     @property
@@ -196,6 +210,9 @@ def _mobile_posed(state: StitchState) -> tuple[np.ndarray, np.ndarray]:
 
 def invalidate_posed(state: StitchState) -> None:
     state.posed = None
+    state._xz_cache_key = None
+    state._xz_hu = None
+    state._xz_mask = None
 
 
 def prepare_posed_volumes(
@@ -287,6 +304,9 @@ def recompose_at_z(state: StitchState, z: int) -> None:
     state.canvas_b = cb
     state.mask_a = ma
     state.mask_b = mb
+    if state.sediment is not None:
+        # center_z stays at Auto-detect (cylinder fixed while browsing Z)
+        rebuild_sediment_mask_2d(state)
 
 
 def recompose(state: StitchState) -> None:
@@ -310,6 +330,8 @@ def recompose(state: StitchState) -> None:
     state.canvas_b = cb
     state.mask_a = ma
     state.mask_b = mb
+    if state.sediment is not None:
+        rebuild_sediment_mask_2d(state)
 
 
 def recompute_overlap(state: StitchState, *, reset_nudge: bool = True) -> OverlapResult:
@@ -446,6 +468,127 @@ def fused_hu(state: StitchState) -> np.ndarray:
     )
 
 
+def core_union_mask(state: StitchState) -> np.ndarray:
+    assert state.mask_a is not None and state.mask_b is not None
+    return state.mask_a | state.mask_b
+
+
+def rebuild_sediment_mask_2d(state: StitchState) -> None:
+    """Refresh sediment.mask_2d = cylinder chord at current view Z."""
+    if state.sediment is None or state.mask_a is None:
+        return
+    sed = state.sediment
+    z_mm = state.posed.z_mm if state.posed is not None else None
+    view_z = float(state.view_z) if state.view_z is not None else None
+    sed.mask_2d = build_sediment_mask_2d(
+        core_union_mask(state),
+        center_col_px=sed.center_col_px,
+        radius_mm=sed.radius_mm,
+        spacing_mm=state.spacing_mm,
+        erode_mm=sed.erode_mm,
+        nudge_x_mm=sed.nudge_x_mm,
+        view_z=view_z,
+        center_z=sed.center_z,
+        spacing_z_mm=z_mm,
+        nudge_z_mm=sed.nudge_z_mm,
+    )
+
+
+def detect_sediment_roi(
+    state: StitchState,
+    *,
+    liner_od_mm: float | None = None,
+    liner_wall_mm: float | None = None,
+) -> SedimentRoi:
+    """Outside-in liner/void peel on current fused slice; store on state."""
+    assert state.canvas_a is not None
+    img = fused_hu(state)
+    mask = core_union_mask(state)
+    prev = state.sediment
+    od = liner_od_mm if liner_od_mm is not None else (prev.liner_od_mm if prev else None)
+    wall = (
+        liner_wall_mm
+        if liner_wall_mm is not None
+        else (prev.liner_wall_mm if prev else None)
+    )
+    cx, radius_mm, liner_hu, void_hu, note = detect_sediment_from_profile(
+        img,
+        mask,
+        spacing_mm=state.spacing_mm,
+        liner_od_mm=od,
+        liner_wall_mm=wall,
+    )
+    cz = float(state.view_z if state.view_z is not None else 0)
+    sed = SedimentRoi(
+        center_col_px=cx,
+        center_z=cz,
+        radius_mm=radius_mm,
+        erode_mm=prev.erode_mm if prev else 0.0,
+        nudge_x_mm=prev.nudge_x_mm if prev else 0.0,
+        nudge_z_mm=prev.nudge_z_mm if prev else 0.0,
+        liner_od_mm=od,
+        liner_wall_mm=wall,
+        liner_hu=liner_hu,
+        void_hu=void_hu,
+        method="outside_in",
+        note=note,
+    )
+    state.sediment = sed
+    rebuild_sediment_mask_2d(state)
+    return sed
+
+
+def build_sediment_volume_mask(state: StitchState) -> np.ndarray:
+    """
+    Build (Z,H,W) sediment cylinder using posed stacks' content masks + ROI.
+
+    Requires posed volumes; uses compose geometry via per-Z core masks on canvas
+    size — builds from posed half masks composed like preview.
+    """
+    if state.sediment is None:
+        raise ValueError("No sediment ROI — run detect first")
+    posed = ensure_posed(state)
+    sed = state.sediment
+    # Compose core masks per Z onto canvas (same lag/col as preview)
+    from core_stitch.overlap import compose_canvases
+
+    lag = state.total_lag_px
+    col = state.total_col_offset_px
+    vol_b, mask_b = posed.vol_b, posed.mask_b
+    dz_px = int(round(state.nudge_z_mm / max(posed.z_mm, 1e-6)))
+    if dz_px != 0:
+        vol_b, mask_b = _shift_stack_z(
+            vol_b, mask_b, dz_px, cval=state.mobile_base.air
+        )
+    cores = []
+    for z in range(posed.n_slices):
+        _ca, _cb, ma, mb = compose_canvases(
+            posed.vol_a[z],
+            posed.mask_a[z],
+            vol_b[z],
+            mask_b[z],
+            lag,
+            col_offset_px=col,
+            cval=state.fixed.air,
+        )
+        cores.append(ma | mb)
+    core3 = np.stack(cores, axis=0)
+    cz = float(sed.center_z)
+    mask3 = build_sediment_mask_3d(
+        core3,
+        center_col_px=sed.center_col_px,
+        center_z=cz,
+        radius_mm=sed.radius_mm,
+        spacing_xy_mm=state.spacing_mm,
+        spacing_z_mm=posed.z_mm,
+        erode_mm=sed.erode_mm,
+        nudge_x_mm=sed.nudge_x_mm,
+        nudge_z_mm=sed.nudge_z_mm,
+    )
+    sed.mask_3d = mask3
+    return mask3
+
+
 def preview_arrays(
     state: StitchState,
     *,
@@ -454,11 +597,13 @@ def preview_arrays(
     opacity_b: float = 0.7,
     crop_core: bool = False,
     pad_mm: float = 3.0,
+    overlay_sediment: bool | None = None,
 ) -> np.ndarray:
     """Return HxW uint8 or HxWx3 uint8 for display / JPEG / 8-bit TIFF."""
     assert state.canvas_a is not None
     assert state.mask_a is not None and state.mask_b is not None
     lo, hi = window_limits(state)
+    show_sed = state.show_sediment if overlay_sediment is None else overlay_sediment
     if align_mode:
         out = alignment_rgb(
             state.canvas_a,
@@ -477,10 +622,202 @@ def preview_arrays(
         u8 = np.clip((fused - lo) / (hi - lo) * 255.0, 0, 255).astype(np.uint8)
         union = state.mask_a | state.mask_b
         out = np.where(union, u8, 0).astype(np.uint8)
+    if (
+        show_sed
+        and state.sediment is not None
+        and state.sediment.mask_2d is not None
+        and state.sediment.mask_2d.any()
+    ):
+        out = overlay_sediment_rgb(out, state.sediment.mask_2d)
     if crop_core:
         pad_px = max(2, int(round(pad_mm / max(state.spacing_mm, 1e-6))))
         box = core_crop_box(state.mask_a, state.mask_b, pad_px=pad_px)
         out = crop_to_box(out, box)
+        if (
+            show_sed
+            and state.sediment is not None
+            and state.sediment.mask_2d is not None
+            and out.ndim == 3
+        ):
+            # overlay already applied before crop — OK
+            pass
+    return out
+
+
+def _posed_b_shifted(
+    state: StitchState,
+) -> tuple[PosedVolumes, np.ndarray, np.ndarray]:
+    posed = ensure_posed(state)
+    vol_b, mask_b = posed.vol_b, posed.mask_b
+    dz_px = int(round(state.nudge_z_mm / max(posed.z_mm, 1e-6)))
+    if dz_px != 0:
+        vol_b, mask_b = _shift_stack_z(
+            vol_b, mask_b, dz_px, cval=state.mobile_base.air
+        )
+    return posed, vol_b, mask_b
+
+
+def default_xz_y_row(state: StitchState, frac: float = 0.5) -> int | None:
+    """
+    Y (row) along upright core for XZ cut; frac in [0,1] within core span.
+
+    Uses a mid-Z posed compose (not the coronal canvas) so the cut matches the
+    volume geometry used to build the XZ plane.
+    """
+    try:
+        posed, vol_b, mask_b = _posed_b_shifted(state)
+    except Exception:
+        return None
+    z = posed.n_slices // 2
+    _ca, _cb, ma, mb = compose_canvases(
+        posed.vol_a[z],
+        posed.mask_a[z],
+        vol_b[z],
+        mask_b[z],
+        state.total_lag_px,
+        col_offset_px=state.total_col_offset_px,
+        cval=state.fixed.air,
+    )
+    union = ma | mb
+    rows = np.where(union.any(axis=1))[0]
+    if rows.size == 0:
+        return union.shape[0] // 2
+    r0, r1 = int(rows[0]), int(rows[-1])
+    t = float(np.clip(frac, 0.0, 1.0))
+    return int(round(r0 + t * (r1 - r0)))
+
+
+def _build_fused_xz_plane(
+    state: StitchState, y_row: int
+) -> tuple[np.ndarray, np.ndarray]:
+    """Fuse every Z at fixed canvas row → HU + core mask shaped (Z, W)."""
+    posed, vol_b, mask_b = _posed_b_shifted(state)
+    lag = state.total_lag_px
+    col = state.total_col_offset_px
+    feather = max(4.0, 12.0 * state.spacing_mm)
+    hu_rows: list[np.ndarray] = []
+    m_rows: list[np.ndarray] = []
+    for z in range(posed.n_slices):
+        ca, cb, ma, mb = compose_canvases(
+            posed.vol_a[z],
+            posed.mask_a[z],
+            vol_b[z],
+            mask_b[z],
+            lag,
+            col_offset_px=col,
+            cval=state.fixed.air,
+        )
+        y = int(np.clip(y_row, 0, ca.shape[0] - 1))
+        # 1-row fuse (same modes as coronal)
+        fused = fuse_preview(
+            ca[y : y + 1],
+            cb[y : y + 1],
+            ma[y : y + 1],
+            mb[y : y + 1],
+            opacity_a=1.0,
+            opacity_b=1.0,
+            mode=state.fuse_mode,
+            feather_mm=feather,
+            spacing_mm=state.spacing_mm,
+            match_hu=state.match_hu,
+        )
+        hu_rows.append(fused[0].astype(np.float32))
+        m_rows.append((ma[y] | mb[y]))
+    return np.stack(hu_rows, axis=0), np.stack(m_rows, axis=0)
+
+
+def preview_xz_arrays(
+    state: StitchState,
+    *,
+    y_frac: float = 0.5,
+    overlay_sediment: bool | None = None,
+    crop_core: bool = True,
+    pad_mm: float = 3.0,
+) -> np.ndarray | None:
+    """
+    Compact XZ QC image (rows=Z, cols=X), isotropic mm display.
+
+    Returns RGB uint8, or None if posed stack not ready.
+    Yellow line = current coronal Z; green ellipse = sediment cylinder.
+    """
+    try:
+        posed = ensure_posed(state)
+    except Exception:
+        return None
+    y_row = default_xz_y_row(state, y_frac)
+    if y_row is None:
+        return None
+
+    key = (
+        id(posed.vol_a),
+        int(state.total_lag_px),
+        int(state.total_col_offset_px),
+        float(state.nudge_z_mm),
+        str(state.fuse_mode),
+        bool(state.match_hu),
+        int(y_row),
+    )
+    if state._xz_cache_key != key or state._xz_hu is None or state._xz_mask is None:
+        state._xz_hu, state._xz_mask = _build_fused_xz_plane(state, y_row)
+        state._xz_cache_key = key
+
+    hu = state._xz_hu
+    msk = state._xz_mask
+    lo, hi = window_limits(state)
+    if hi <= lo:
+        hi = lo + 1.0
+    u8 = np.clip((hu - lo) / (hi - lo) * 255.0, 0, 255).astype(np.uint8)
+    # Show something even outside mask (dim) so the panel never looks "empty"
+    u8_out = np.where(msk, u8, (u8.astype(np.float32) * 0.15).astype(np.uint8))
+
+    # Crop X to core columns (keep full Z)
+    c0, c1 = 0, u8_out.shape[1]
+    if crop_core and msk.any():
+        cols = np.where(msk.any(axis=0))[0]
+        if cols.size:
+            pad_px = max(2, int(round(pad_mm / max(state.spacing_mm, 1e-6))))
+            c0 = max(0, int(cols[0]) - pad_px)
+            c1 = min(u8_out.shape[1], int(cols[-1]) + 1 + pad_px)
+            u8_out = u8_out[:, c0:c1]
+            msk = msk[:, c0:c1]
+
+    show_sed = state.show_sediment if overlay_sediment is None else overlay_sediment
+    view_z = float(state.view_z) if state.view_z is not None else float(posed.n_slices // 2)
+
+    if show_sed and state.sediment is not None:
+        sed = state.sediment
+        r_mm = sed.effective_radius_mm
+        cx = sed.center_col_px + sed.nudge_x_mm / max(state.spacing_mm, 1e-6) - c0
+        cz = sed.center_z + sed.nudge_z_mm / max(posed.z_mm, 1e-6)
+        out = overlay_sediment_circle_xz(
+            u8_out,
+            center_x_px=cx,
+            center_z_px=cz,
+            radius_x_px=r_mm / max(state.spacing_mm, 1e-6),
+            radius_z_px=r_mm / max(posed.z_mm, 1e-6),
+            view_z_px=view_z,
+        )
+    else:
+        out = np.stack([u8_out, u8_out, u8_out], axis=-1)
+        if 0 <= view_z < out.shape[0]:
+            out[int(round(view_z)), :] = (255, 220, 60)
+
+    # Isotropic display: scale Z so 1 px ≈ spacing_xy mm
+    # (per-channel resize — avoids skimage channel_axis / multichannel API drift)
+    z_scale = float(posed.z_mm) / max(state.spacing_mm, 1e-6)
+    if abs(z_scale - 1.0) > 0.05 and out.shape[0] > 1:
+        new_h = max(1, int(round(out.shape[0] * z_scale)))
+        chans = [
+            resize(
+                out[:, :, i].astype(np.float32),
+                (new_h, out.shape[1]),
+                order=1,
+                preserve_range=True,
+                anti_aliasing=True,
+            )
+            for i in range(out.shape[2])
+        ]
+        out = np.clip(np.stack(chans, axis=-1), 0, 255).astype(np.uint8)
     return out
 
 
@@ -796,6 +1133,29 @@ def sidecar_dict(state: StitchState) -> dict:
             "score_before": ref.score_before,
             "method": ref.method,
             "shift_px_zyx": list(ref.shift_px),
+        },
+        "sediment": None
+        if state.sediment is None
+        else {
+            "center_col_px": state.sediment.center_col_px,
+            "center_z": state.sediment.center_z,
+            "radius_mm": state.sediment.radius_mm,
+            "erode_mm": state.sediment.erode_mm,
+            "effective_radius_mm": state.sediment.effective_radius_mm,
+            "nudge_x_mm": state.sediment.nudge_x_mm,
+            "nudge_z_mm": state.sediment.nudge_z_mm,
+            "liner_od_mm": state.sediment.liner_od_mm,
+            "liner_wall_mm": state.sediment.liner_wall_mm,
+            "liner_hu": state.sediment.liner_hu,
+            "void_hu": state.sediment.void_hu,
+            "method": state.sediment.method,
+            "note": state.sediment.note,
+            "has_mask_2d": bool(
+                state.sediment.mask_2d is not None and state.sediment.mask_2d.any()
+            ),
+            "has_mask_3d": bool(
+                state.sediment.mask_3d is not None and state.sediment.mask_3d.any()
+            ),
         },
         "warnings": list(state.warnings),
     }
