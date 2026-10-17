@@ -1,0 +1,28 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "core-stitch"
+version = "0.1.0"
+description = "Geometry-first stitch for Aquilion Coron TOP/BTM MPR halves"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "numpy>=1.26",
+    "Pillow>=10.0",
+    "pydicom>=3.0",
+    "pylibjpeg[all]>=2.0",
+    "pylibjpeg-libjpeg>=2.0",
+    "pylibjpeg-openjpeg>=2.0",
+    "pylibjpeg-rle>=2.0",
+    "scikit-image>=0.22",
+    "scipy>=1.11",
+]
+
+[project.scripts]
+core-stitch = "core_stitch.gui:main"
+core-stitch-cli = "core_stitch.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
