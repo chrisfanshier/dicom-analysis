@@ -224,6 +224,8 @@ def export_accept(
             opacity_b=1.0,
             crop_core=True,
             pad_mm=pad_mm,
+            overlay_sediment=False,
+            downcore_plot=False,
         )
         meta["export_shape_px"] = [int(gray.shape[0]), int(gray.shape[1])]
         meta["export_jpeg_cropped"] = True
@@ -337,6 +339,7 @@ def export_accept(
             crop_core=False,
             pad_mm=pad_mm,
             overlay_sediment=False,
+            downcore_plot=False,
         )
         sm = state.sediment.mask_2d
         if roi_gray.ndim == 2:

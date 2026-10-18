@@ -18,7 +18,9 @@ from core_stitch.pipeline import (
     build_sediment_volume_mask,
     coarse_align,
     detect_sediment_roi,
+    ensure_downcore_profile,
     ensure_posed,
+    invalidate_downcore_profile,
     masked_hu_values,
     preview_arrays,
     preview_xz_arrays,
@@ -86,6 +88,7 @@ class StitchGui(tk.Tk):
         self.export_sediment_mask = tk.BooleanVar(value=False)
         self.export_sediment_roi = tk.BooleanVar(value=False)
         self.show_sediment = tk.BooleanVar(value=True)
+        self.show_downcore = tk.BooleanVar(value=False)
         self.sed_erode = tk.DoubleVar(value=0.0)
         self.sed_nudge_x = tk.DoubleVar(value=0.0)
         self.sed_nudge_z = tk.DoubleVar(value=0.0)
@@ -94,7 +97,7 @@ class StitchGui(tk.Tk):
         self.liner_od = tk.DoubleVar(value=70.0)
         self.liner_wall = tk.DoubleVar(value=3.0)
         self.xz_y_frac = tk.DoubleVar(value=0.5)
-        self.xz_label = tk.StringVar(value="XZ: align first")
+        self.xz_label = tk.StringVar(value="XZ: idle (builds after Z stack)")
         self.win_lo = tk.DoubleVar(value=0.0)
         self.win_hi = tk.DoubleVar(value=1.0)
         self.win_label = tk.StringVar(value="Window: —")
@@ -102,6 +105,8 @@ class StitchGui(tk.Tk):
         self._win_job: str | None = None
         self._sed_job: str | None = None
         self._xz_job: str | None = None
+        self._downcore_job: str | None = None
+        self._z_load_job: str | None = None
         self._hist_range: tuple[float, float] = (0.0, 1.0)
         self._hist_counts: np.ndarray | None = None
         self._hist_edges: np.ndarray | None = None
@@ -199,7 +204,7 @@ class StitchGui(tk.Tk):
         ttk.Label(yrow, text="← top · btm →", font=("", 8)).pack(side=tk.LEFT)
 
         self.canvas.bind("<Configure>", lambda _e: self._schedule_refresh())
-        self.xz_canvas.bind("<Configure>", lambda _e: self._schedule_refresh())
+        self.xz_canvas.bind("<Configure>", lambda _e: self._schedule_xz_refresh())
         self.canvas.bind("<MouseWheel>", self._on_mousewheel)
         self.canvas.bind("<Button-4>", lambda e: self._on_mousewheel_linux(e, 1))
         self.canvas.bind("<Button-5>", lambda e: self._on_mousewheel_linux(e, -1))
@@ -463,6 +468,19 @@ class StitchGui(tk.Tk):
             variable=self.show_sediment,
             command=self._on_show_sediment,
         ).pack(anchor=tk.W)
+        ttk.Checkbutton(
+            parent,
+            text="Show downcore mean HU plot",
+            variable=self.show_downcore,
+            command=self._on_show_downcore,
+        ).pack(anchor=tk.W)
+        ttk.Label(
+            parent,
+            text="Plot sits to the right of the core; Y matches core top→bottom. "
+            "First compute can take a while (runs after the image paints).",
+            font=("", 8),
+            wraplength=320,
+        ).pack(anchor=tk.W)
         ttk.Label(parent, textvariable=self.sed_label, wraplength=320).pack(
             anchor=tk.W, pady=(6, 0)
         )
@@ -637,22 +655,34 @@ class StitchGui(tk.Tk):
                 "Overlap peak is ambiguous or weak.\n"
                 "Use Flip, opacity, and X/Y nudge to QC, then Accept.",
             )
-        self.status.set("Coarse align done — loading Z stack for slice browser…")
         self.zoom_var.set(1.0)
+        self._auto_window()
+        # Paint mid-slice immediately — do not block on full Z stack / XZ / profile
+        self.status.set("Coarse align done — showing mid-slice…")
+        self._schedule_refresh()
+        self.z_label.set("Slice: loading stack…")
+        if self._z_load_job is not None:
+            self.after_cancel(self._z_load_job)
+        self._z_load_job = self.after(50, self._load_z_stack_deferred)
+
+    def _load_z_stack_deferred(self) -> None:
+        """Build posed volumes off the critical path so the first image can paint."""
+        self._z_load_job = None
+        if self.state is None:
+            return
+        self.status.set("Loading Z stack for slice browser…")
         self.update_idletasks()
         try:
             self._init_z_browser()
         except Exception as exc:
             self.z_label.set("Slice: mid only")
             self.status.set(f"Coarse done (Z browser unavailable: {exc})")
-        else:
-            self.status.set(
-                "Coarse align done — set greyscale window, cycle Slice, then Export."
-            )
-        self._auto_window()
+            return
+        self.status.set(
+            "Z stack ready — set greyscale window, cycle Slice, then Export."
+        )
         self._schedule_refresh()
-        # XZ needs the posed stack; build after layout has a real width
-        self.after(200, self._refresh_xz)
+        self._schedule_xz_refresh(delay_ms=300)
 
     def _init_z_browser(self) -> None:
         if self.state is None:
@@ -690,6 +720,7 @@ class StitchGui(tk.Tk):
             messagebox.showerror("Slice", str(exc))
             return
         self._schedule_refresh()
+        self._schedule_xz_refresh(delay_ms=50)
 
     def _z_mid(self) -> None:
         if self.state is None:
@@ -1028,16 +1059,29 @@ class StitchGui(tk.Tk):
         self.sed_nudge_x.set(sed.nudge_x_mm)
         self.sed_nudge_z.set(sed.nudge_z_mm)
         self.state.show_sediment = bool(self.show_sediment.get())
+        self.state.show_downcore_plot = bool(self.show_downcore.get())
+        invalidate_downcore_profile(self.state)
         self._sync_sediment_label()
         self.status.set(
             f"Sediment ROI: R={sed.effective_radius_mm:.1f} mm — tweak erode/nudge as needed."
         )
         self._schedule_refresh()
+        self._schedule_xz_refresh(delay_ms=200)
+        if bool(self.show_downcore.get()):
+            self._schedule_downcore_compute()
 
     def _on_show_sediment(self) -> None:
         if self.state is not None:
             self.state.show_sediment = bool(self.show_sediment.get())
         self._schedule_refresh()
+        self._schedule_xz_refresh(delay_ms=100)
+
+    def _on_show_downcore(self) -> None:
+        if self.state is not None:
+            self.state.show_downcore_plot = bool(self.show_downcore.get())
+        self._schedule_refresh()
+        if bool(self.show_downcore.get()):
+            self._schedule_downcore_compute()
 
     def _on_sediment_adjust(self, _value: str | None = None) -> None:
         if self._sed_job is not None:
@@ -1052,9 +1096,13 @@ class StitchGui(tk.Tk):
         self.state.sediment.nudge_x_mm = float(self.sed_nudge_x.get())
         self.state.sediment.nudge_z_mm = float(self.sed_nudge_z.get())
         self.state.sediment.mask_3d = None  # invalidate volume mask
+        invalidate_downcore_profile(self.state)
         rebuild_sediment_mask_2d(self.state)
         self._sync_sediment_label()
         self._schedule_refresh()
+        self._schedule_xz_refresh(delay_ms=150)
+        if bool(self.show_downcore.get()):
+            self._schedule_downcore_compute(delay_ms=200)
 
     def _reset_sediment_nudge(self) -> None:
         self.sed_nudge_x.set(0.0)
@@ -1074,11 +1122,13 @@ class StitchGui(tk.Tk):
             self.status.set(f"3D mask failed: {exc}")
             return
         self._sync_sediment_label()
+        invalidate_downcore_profile(self.state)
         self.status.set(
             f"3D sediment mask ready: {tuple(m3.shape)} · "
             f"{int(m3.sum())} voxels — enable mask export on Export tab."
         )
         self.export_sediment_mask.set(True)
+        self._schedule_refresh()
 
     def accept_export(self) -> None:
         if self.state is None:
@@ -1195,10 +1245,40 @@ class StitchGui(tk.Tk):
             self.after_cancel(self._refresh_job)
         self._refresh_job = self.after(40, self.refresh)
 
-    def _on_xz_y_slide(self, _value: str | None = None) -> None:
+    def _schedule_xz_refresh(self, delay_ms: int = 80) -> None:
         if self._xz_job is not None:
             self.after_cancel(self._xz_job)
-        self._xz_job = self.after(80, self._refresh_xz)
+        self._xz_job = self.after(delay_ms, self._refresh_xz)
+
+    def _schedule_downcore_compute(self, delay_ms: int = 100) -> None:
+        if self._downcore_job is not None:
+            self.after_cancel(self._downcore_job)
+        self._downcore_job = self.after(delay_ms, self._compute_downcore)
+
+    def _compute_downcore(self) -> None:
+        """Heavy stack average — runs after the coronal image has painted."""
+        self._downcore_job = None
+        if self.state is None or self.state.sediment is None:
+            return
+        if not bool(self.show_downcore.get()):
+            return
+        if self.state.posed is None:
+            self.status.set("Downcore plot waiting for Z stack…")
+            self._schedule_downcore_compute(delay_ms=400)
+            return
+        self.status.set("Computing downcore mean HU (all Z)…")
+        self.update_idletasks()
+        try:
+            prof = ensure_downcore_profile(self.state)
+        except Exception as exc:
+            self.status.set(f"Downcore HU failed: {exc}")
+            return
+        n_ok = int(np.isfinite(prof.mean_hu).sum())
+        self.status.set(f"Downcore mean HU ready ({n_ok} rows) — plot right of core.")
+        self._schedule_refresh()
+
+    def _on_xz_y_slide(self, _value: str | None = None) -> None:
+        self._schedule_xz_refresh(delay_ms=80)
 
     def _refresh_xz(self) -> None:
         self._xz_job = None
@@ -1206,19 +1286,24 @@ class StitchGui(tk.Tk):
             self.xz_label.set("XZ: run coarse align first")
             self.xz_canvas.delete("all")
             return
+        if self.state.posed is None:
+            self.xz_label.set("XZ: waiting for Z stack…")
+            return
         # Wait until the panel has a real width (first layout can be ~1 px)
         cw = max(self.xz_canvas.winfo_width(), self.xz_frame.winfo_width() - 16)
         ch = max(self.xz_canvas.winfo_height(), 120)
         if cw < 40:
             self.xz_label.set("XZ: waiting for layout…")
-            self.after(150, self._refresh_xz)
+            self._schedule_xz_refresh(delay_ms=150)
             return
-        self.xz_label.set("XZ: building… (first time can take a few seconds)")
-        self.update_idletasks()
+        # Fast path: redraw from cache only
+        cache_ready = self.state._xz_hu is not None
+        if not cache_ready:
+            self.xz_label.set("XZ: building… (first time can take a few seconds)")
+            self.update_idletasks()
         try:
-            ensure_posed(self.state)
             if self.state.view_z is None:
-                self.state.view_z = self.state.posed.n_slices // 2  # type: ignore[union-attr]
+                self.state.view_z = self.state.posed.n_slices // 2
             arr = preview_xz_arrays(
                 self.state,
                 y_frac=float(self.xz_y_frac.get()),
@@ -1261,14 +1346,20 @@ class StitchGui(tk.Tk):
         self._refresh_job = None
         if self.state is None:
             return
-        arr = preview_arrays(
-            self.state,
-            align_mode=self.align_var.get(),
-            opacity_a=float(self.opacity_a.get()),
-            opacity_b=float(self.opacity_b.get()),
-            crop_core=bool(self.crop_core_var.get()),
-            pad_mm=3.0,
-        )
+        self.state.show_downcore_plot = bool(self.show_downcore.get())
+        try:
+            arr = preview_arrays(
+                self.state,
+                align_mode=self.align_var.get(),
+                opacity_a=float(self.opacity_a.get()),
+                opacity_b=float(self.opacity_b.get()),
+                crop_core=bool(self.crop_core_var.get()),
+                pad_mm=3.0,
+                downcore_plot=bool(self.show_downcore.get()),
+            )
+        except Exception as exc:
+            self.status.set(f"Preview failed: {exc}")
+            return
         if arr.ndim == 2:
             full = Image.fromarray(arr, mode="L")
         else:
@@ -1289,7 +1380,6 @@ class StitchGui(tk.Tk):
         self.canvas.create_image(0, 0, image=self._photo, anchor=tk.NW, tags=("img",))
         self.canvas.configure(scrollregion=(0, 0, disp_w, disp_h))
         self.zoom_label.set(f"Zoom: {int(round(zoom * 100))}%")
-        self._refresh_xz()
         # Keep histogram markers in sync when slice/fuse changes
         if self._hist_counts is not None:
             try:
@@ -1301,6 +1391,13 @@ class StitchGui(tk.Tk):
                 self._draw_histogram()
             except Exception:
                 pass
+        # If plot is on but cache empty, kick compute after paint (non-blocking path)
+        if (
+            bool(self.show_downcore.get())
+            and self.state.sediment is not None
+            and self.state._downcore_profile is None
+        ):
+            self._schedule_downcore_compute(delay_ms=50)
 
 
 def main(argv: list[str] | None = None) -> int:

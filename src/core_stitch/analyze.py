@@ -5,6 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 import numpy as np
+from PIL import Image, ImageDraw, ImageFont
 from scipy.ndimage import binary_erosion, gaussian_filter1d
 
 # Common whole-core liner presets (OD, wall) in mm — edit as needed
@@ -362,3 +363,113 @@ def overlay_sediment_circle_xz(
     out[cz_i, max(0, cx_i - 3) : min(w, cx_i + 4)] = (40, 255, 80)
     out[max(0, cz_i - 3) : min(nz, cz_i + 4), cx_i] = (40, 255, 80)
     return out
+
+
+@dataclass
+class DowncoreProfile:
+    """Mean HU along upright core axis (Y / rows) inside sediment ROI."""
+
+    mean_hu: np.ndarray  # (H,) float; NaN where no sediment voxels
+    count: np.ndarray  # (H,) int voxel counts
+    spacing_mm: float
+    method: str = "cylinder_stack"
+
+    @property
+    def n_rows(self) -> int:
+        return int(self.mean_hu.shape[0])
+
+
+def mean_hu_per_row(image: np.ndarray, mask: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    """Row-wise mean HU and counts; mean is NaN where count==0."""
+    h, _w = image.shape
+    img = image.astype(np.float64)
+    m = mask.astype(bool)
+    counts = m.sum(axis=1).astype(np.int64)
+    sums = np.where(m, img, 0.0).sum(axis=1)
+    mean = np.full(h, np.nan, dtype=np.float64)
+    ok = counts > 0
+    mean[ok] = sums[ok] / counts[ok]
+    return mean, counts
+
+
+def render_downcore_plot_rgb(
+    profile: DowncoreProfile,
+    *,
+    row0: int,
+    row1: int,
+    width: int = 160,
+    hu_lo: float | None = None,
+    hu_hi: float | None = None,
+    smooth_sigma_px: float = 1.5,
+) -> np.ndarray:
+    """
+    Vertical line plot of mean HU for rows [row0, row1).
+
+    Output height == (row1-row0) so each plot row lines up with the coronal crop.
+    X = HU (left→right), Y = downcore (top→bottom, same as image).
+    """
+    row0 = int(np.clip(row0, 0, profile.n_rows))
+    row1 = int(np.clip(row1, row0 + 1, profile.n_rows))
+    h = row1 - row0
+    w = max(48, int(width))
+    mean = profile.mean_hu[row0:row1].astype(np.float64).copy()
+    if smooth_sigma_px > 0.5 and np.isfinite(mean).sum() > 8:
+        finite = np.isfinite(mean)
+        filled = mean.copy()
+        idx = np.arange(h)
+        if finite.any():
+            filled[~finite] = np.interp(idx[~finite], idx[finite], mean[finite])
+            sm = gaussian_filter1d(filled, sigma=smooth_sigma_px, mode="nearest")
+            mean = np.where(finite, sm, np.nan)
+
+    finite = mean[np.isfinite(mean)]
+    if finite.size == 0:
+        return np.full((h, w, 3), 18, dtype=np.uint8)
+    if hu_lo is None or hu_hi is None:
+        lo = float(np.nanpercentile(finite, 2))
+        hi = float(np.nanpercentile(finite, 98))
+    else:
+        lo, hi = float(hu_lo), float(hu_hi)
+    if hi <= lo:
+        hi = lo + 1.0
+
+    pad_l, pad_r = 4, 4
+    bg = (18, 18, 22)
+    im = Image.new("RGB", (w, h), bg)
+    draw = ImageDraw.Draw(im)
+    try:
+        font = ImageFont.load_default()
+    except Exception:
+        font = None
+
+    x0, x1 = pad_l, w - pad_r - 1
+    draw.rectangle([x0, 0, x1, h - 1], outline=(60, 60, 70))
+
+    for frac in (0.0, 0.5, 1.0):
+        hu = lo + frac * (hi - lo)
+        xp = x0 + int(round(frac * (x1 - x0)))
+        draw.line([(xp, 0), (xp, h - 1)], fill=(45, 45, 55), width=1)
+        if font is not None:
+            draw.text((max(0, xp - 8), 2), f"{hu:.0f}", fill=(150, 150, 160), font=font)
+
+    if font is not None:
+        draw.text((pad_l, h - 12), "← HU →", fill=(140, 140, 150), font=font)
+
+    pts: list[tuple[int, int]] = []
+    for i, v in enumerate(mean):
+        if not np.isfinite(v):
+            if len(pts) >= 2:
+                draw.line(pts, fill=(120, 220, 160), width=2)
+            pts = []
+            continue
+        t = float(np.clip((float(v) - lo) / (hi - lo), 0.0, 1.0))
+        xp = x0 + int(round(t * (x1 - x0)))
+        pts.append((xp, i))
+    if len(pts) >= 2:
+        draw.line(pts, fill=(120, 220, 160), width=2)
+    elif len(pts) == 1:
+        draw.ellipse(
+            [pts[0][0] - 1, pts[0][1] - 1, pts[0][0] + 1, pts[0][1] + 1],
+            fill=(120, 220, 160),
+        )
+    return np.asarray(im, dtype=np.uint8)

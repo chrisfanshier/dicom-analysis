@@ -32,12 +32,15 @@ from core_stitch.overlap import (
     upright_angle,
 )
 from core_stitch.analyze import (
+    DowncoreProfile,
     SedimentRoi,
     build_sediment_mask_2d,
     build_sediment_mask_3d,
     detect_sediment_from_profile,
+    mean_hu_per_row,
     overlay_sediment_circle_xz,
     overlay_sediment_rgb,
+    render_downcore_plot_rgb,
 )
 from core_stitch.refine import RefineResult, _shift_stack_z, refine_join_volumes
 from core_stitch.segment import mid_slice, segment_core
@@ -97,10 +100,14 @@ class StitchState:
     mask_b: np.ndarray | None = None
     sediment: SedimentRoi | None = None
     show_sediment: bool = True
+    show_downcore_plot: bool = False
     # Cached fused XZ plane for compact QC panel: key, HU (Z,W), mask (Z,W)
     _xz_cache_key: tuple | None = None
     _xz_hu: np.ndarray | None = None
     _xz_mask: np.ndarray | None = None
+    # Cached downcore mean HU inside sediment cylinder
+    _downcore_cache_key: tuple | None = None
+    _downcore_profile: DowncoreProfile | None = None
     warnings: list[str] = field(default_factory=list)
 
     @property
@@ -213,6 +220,13 @@ def invalidate_posed(state: StitchState) -> None:
     state._xz_cache_key = None
     state._xz_hu = None
     state._xz_mask = None
+    state._downcore_cache_key = None
+    state._downcore_profile = None
+
+
+def invalidate_downcore_profile(state: StitchState) -> None:
+    state._downcore_cache_key = None
+    state._downcore_profile = None
 
 
 def prepare_posed_volumes(
@@ -589,6 +603,133 @@ def build_sediment_volume_mask(state: StitchState) -> np.ndarray:
     return mask3
 
 
+def _downcore_cache_key(state: StitchState) -> tuple | None:
+    if state.sediment is None:
+        return None
+    try:
+        posed = ensure_posed(state)
+    except Exception:
+        return None
+    sed = state.sediment
+    return (
+        id(posed.vol_a),
+        int(state.total_lag_px),
+        int(state.total_col_offset_px),
+        float(state.nudge_z_mm),
+        str(state.fuse_mode),
+        bool(state.match_hu),
+        float(sed.center_col_px),
+        float(sed.center_z),
+        float(sed.radius_mm),
+        float(sed.erode_mm),
+        float(sed.nudge_x_mm),
+        float(sed.nudge_z_mm),
+        bool(sed.mask_3d is not None),
+    )
+
+
+def compute_downcore_mean_hu(state: StitchState) -> DowncoreProfile:
+    """
+    Mean HU along Y inside the sediment cylinder, averaged over Z (and X).
+
+    Uses mask_3d when present; otherwise accumulates per-Z cylinder chords.
+    """
+    if state.sediment is None:
+        raise ValueError("No sediment ROI — run Auto sediment first")
+    sed = state.sediment
+    posed, vol_b, mask_b = _posed_b_shifted(state)
+    lag = state.total_lag_px
+    col = state.total_col_offset_px
+    feather = max(4.0, 12.0 * state.spacing_mm)
+
+    # Establish canvas shape from mid Z
+    z0 = posed.n_slices // 2
+    ca0, cb0, ma0, mb0 = compose_canvases(
+        posed.vol_a[z0],
+        posed.mask_a[z0],
+        vol_b[z0],
+        mask_b[z0],
+        lag,
+        col_offset_px=col,
+        cval=state.fixed.air,
+    )
+    h, w = ca0.shape
+    sum_hu = np.zeros(h, dtype=np.float64)
+    count = np.zeros(h, dtype=np.float64)
+
+    use_m3 = (
+        sed.mask_3d is not None
+        and sed.mask_3d.shape[0] == posed.n_slices
+        and sed.mask_3d.shape[1] == h
+        and sed.mask_3d.shape[2] == w
+    )
+
+    for z in range(posed.n_slices):
+        ca, cb, ma, mb = compose_canvases(
+            posed.vol_a[z],
+            posed.mask_a[z],
+            vol_b[z],
+            mask_b[z],
+            lag,
+            col_offset_px=col,
+            cval=state.fixed.air,
+        )
+        fused = fuse_preview(
+            ca,
+            cb,
+            ma,
+            mb,
+            opacity_a=1.0,
+            opacity_b=1.0,
+            mode=state.fuse_mode,
+            feather_mm=feather,
+            spacing_mm=state.spacing_mm,
+            match_hu=state.match_hu,
+        )
+        if use_m3:
+            sm = sed.mask_3d[z]  # type: ignore[index]
+        else:
+            sm = build_sediment_mask_2d(
+                ma | mb,
+                center_col_px=sed.center_col_px,
+                radius_mm=sed.radius_mm,
+                spacing_mm=state.spacing_mm,
+                erode_mm=sed.erode_mm,
+                nudge_x_mm=sed.nudge_x_mm,
+                view_z=float(z),
+                center_z=sed.center_z,
+                spacing_z_mm=posed.z_mm,
+                nudge_z_mm=sed.nudge_z_mm,
+            )
+        _mean, cnt = mean_hu_per_row(fused, sm)
+        ok = cnt > 0
+        sum_hu[ok] += _mean[ok] * cnt[ok]
+        count[ok] += cnt[ok]
+
+    mean = np.full(h, np.nan, dtype=np.float64)
+    ok = count > 0
+    mean[ok] = sum_hu[ok] / count[ok]
+    return DowncoreProfile(
+        mean_hu=mean,
+        count=count.astype(np.int64),
+        spacing_mm=state.spacing_mm,
+        method="mask_3d_stack" if use_m3 else "cylinder_chord_stack",
+    )
+
+
+def ensure_downcore_profile(state: StitchState) -> DowncoreProfile:
+    """Return cached downcore profile, recomputing when pose/ROI changes."""
+    key = _downcore_cache_key(state)
+    if key is None:
+        raise ValueError("No sediment ROI — run Auto sediment first")
+    if state._downcore_profile is not None and state._downcore_cache_key == key:
+        return state._downcore_profile
+    prof = compute_downcore_mean_hu(state)
+    state._downcore_profile = prof
+    state._downcore_cache_key = key
+    return prof
+
+
 def preview_arrays(
     state: StitchState,
     *,
@@ -598,12 +739,15 @@ def preview_arrays(
     crop_core: bool = False,
     pad_mm: float = 3.0,
     overlay_sediment: bool | None = None,
+    downcore_plot: bool | None = None,
+    plot_width: int = 160,
 ) -> np.ndarray:
     """Return HxW uint8 or HxWx3 uint8 for display / JPEG / 8-bit TIFF."""
     assert state.canvas_a is not None
     assert state.mask_a is not None and state.mask_b is not None
     lo, hi = window_limits(state)
     show_sed = state.show_sediment if overlay_sediment is None else overlay_sediment
+    show_plot = state.show_downcore_plot if downcore_plot is None else downcore_plot
     if align_mode:
         out = alignment_rgb(
             state.canvas_a,
@@ -629,18 +773,32 @@ def preview_arrays(
         and state.sediment.mask_2d.any()
     ):
         out = overlay_sediment_rgb(out, state.sediment.mask_2d)
+
+    box = (0, out.shape[0], 0, out.shape[1])
     if crop_core:
         pad_px = max(2, int(round(pad_mm / max(state.spacing_mm, 1e-6))))
         box = core_crop_box(state.mask_a, state.mask_b, pad_px=pad_px)
         out = crop_to_box(out, box)
+
+    # Plot only if already cached — never compute here (keeps GUI paint responsive)
+    if show_plot and state.sediment is not None and state.canvas_a is not None:
+        key = _downcore_cache_key(state)
+        prof = state._downcore_profile
         if (
-            show_sed
-            and state.sediment is not None
-            and state.sediment.mask_2d is not None
-            and out.ndim == 3
+            prof is not None
+            and key is not None
+            and state._downcore_cache_key == key
+            and prof.n_rows == state.canvas_a.shape[0]
         ):
-            # overlay already applied before crop — OK
-            pass
+            r0, r1, _c0, _c1 = box
+            if out.ndim == 2:
+                out = np.stack([out, out, out], axis=-1)
+            strip = render_downcore_plot_rgb(
+                prof, row0=r0, row1=r1, width=plot_width
+            )
+            if strip.shape[0] == out.shape[0]:
+                sep = np.full((out.shape[0], 3, 3), 40, dtype=np.uint8)
+                out = np.concatenate([out, sep, strip], axis=1)
     return out
 
 
