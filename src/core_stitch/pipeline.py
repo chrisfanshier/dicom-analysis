@@ -32,13 +32,19 @@ from core_stitch.overlap import (
     upright_angle,
 )
 from core_stitch.analyze import (
+    HU_HIST_BINS,
+    HU_HIST_HI,
+    HU_HIST_LO,
     DowncoreProfile,
     SedimentRoi,
     build_sediment_mask_2d,
     build_sediment_mask_3d,
+    class_masks_from_hu,
     detect_sediment_from_profile,
     mean_hu_per_row,
+    multi_otsu_two_thresholds,
     overlay_sediment_circle_xz,
+    overlay_sediment_classes_rgb,
     overlay_sediment_rgb,
     render_downcore_plot_rgb,
 )
@@ -488,13 +494,13 @@ def core_union_mask(state: StitchState) -> np.ndarray:
 
 
 def rebuild_sediment_mask_2d(state: StitchState) -> None:
-    """Refresh sediment.mask_2d = cylinder chord at current view Z."""
+    """Refresh cylinder chord + optional class masks at current view Z."""
     if state.sediment is None or state.mask_a is None:
         return
     sed = state.sediment
     z_mm = state.posed.z_mm if state.posed is not None else None
     view_z = float(state.view_z) if state.view_z is not None else None
-    sed.mask_2d = build_sediment_mask_2d(
+    cyl = build_sediment_mask_2d(
         core_union_mask(state),
         center_col_px=sed.center_col_px,
         radius_mm=sed.radius_mm,
@@ -506,6 +512,23 @@ def rebuild_sediment_mask_2d(state: StitchState) -> None:
         spacing_z_mm=z_mm,
         nudge_z_mm=sed.nudge_z_mm,
     )
+    sed.mask_2d = cyl
+    if sed.has_thresholds and state.canvas_a is not None:
+        include, low, high = class_masks_from_hu(
+            fused_hu(state),
+            cyl,
+            thr_lo=float(sed.thr_lo_hu),  # type: ignore[arg-type]
+            thr_hi=float(sed.thr_hi_hu),  # type: ignore[arg-type]
+            exclude_low=sed.exclude_low,
+            exclude_high=sed.exclude_high,
+        )
+        sed.mask_include_2d = include
+        sed.mask_low_2d = low
+        sed.mask_high_2d = high
+    else:
+        sed.mask_include_2d = cyl
+        sed.mask_low_2d = None
+        sed.mask_high_2d = None
 
 
 def detect_sediment_roi(
@@ -546,6 +569,12 @@ def detect_sediment_roi(
         void_hu=void_hu,
         method="outside_in",
         note=note,
+        exclude_low=prev.exclude_low if prev else True,
+        exclude_high=prev.exclude_high if prev else True,
+        # New geometry → clear thresholds until Auto Otsu / downcore compute
+        thr_lo_hu=None,
+        thr_hi_hu=None,
+        filter_method="none",
     )
     state.sediment = sed
     rebuild_sediment_mask_2d(state)
@@ -625,14 +654,84 @@ def _downcore_cache_key(state: StitchState) -> tuple | None:
         float(sed.nudge_x_mm),
         float(sed.nudge_z_mm),
         bool(sed.mask_3d is not None),
+        bool(sed.exclude_low),
+        bool(sed.exclude_high),
+        None if sed.thr_lo_hu is None else round(float(sed.thr_lo_hu), 3),
+        None if sed.thr_hi_hu is None else round(float(sed.thr_hi_hu), 3),
+        str(sed.filter_method),
     )
 
 
-def compute_downcore_mean_hu(state: StitchState) -> DowncoreProfile:
+def _cylinder_mask_at_z(
+    state: StitchState,
+    *,
+    z: int,
+    vol_b: np.ndarray,
+    mask_b: np.ndarray,
+    lag: int,
+    col: int,
+    posed: PosedVolumes,
+    h: int,
+    w: int,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Return (fused HU, cylinder bool) for one Z on the stitch canvas."""
+    sed = state.sediment
+    assert sed is not None
+    ca, cb, ma, mb = compose_canvases(
+        posed.vol_a[z],
+        posed.mask_a[z],
+        vol_b[z],
+        mask_b[z],
+        lag,
+        col_offset_px=col,
+        cval=state.fixed.air,
+    )
+    feather = max(4.0, 12.0 * state.spacing_mm)
+    fused = fuse_preview(
+        ca,
+        cb,
+        ma,
+        mb,
+        opacity_a=1.0,
+        opacity_b=1.0,
+        mode=state.fuse_mode,
+        feather_mm=feather,
+        spacing_mm=state.spacing_mm,
+        match_hu=state.match_hu,
+    )
+    use_m3 = (
+        sed.mask_3d is not None
+        and sed.mask_3d.shape[0] == posed.n_slices
+        and sed.mask_3d.shape[1] == h
+        and sed.mask_3d.shape[2] == w
+    )
+    if use_m3:
+        sm = sed.mask_3d[z]  # type: ignore[index]
+    else:
+        sm = build_sediment_mask_2d(
+            ma | mb,
+            center_col_px=sed.center_col_px,
+            radius_mm=sed.radius_mm,
+            spacing_mm=state.spacing_mm,
+            erode_mm=sed.erode_mm,
+            nudge_x_mm=sed.nudge_x_mm,
+            view_z=float(z),
+            center_z=sed.center_z,
+            spacing_z_mm=posed.z_mm,
+            nudge_z_mm=sed.nudge_z_mm,
+        )
+    return fused, sm
+
+
+def compute_downcore_mean_hu(
+    state: StitchState,
+    *,
+    recompute_otsu: bool = False,
+) -> DowncoreProfile:
     """
     Mean HU along Y inside the sediment cylinder, averaged over Z (and X).
 
-    Uses mask_3d when present; otherwise accumulates per-Z cylinder chords.
+    Optionally runs global multi-Otsu and excludes low/high classes from the mean.
     """
     if state.sediment is None:
         raise ValueError("No sediment ROI — run Auto sediment first")
@@ -640,11 +739,9 @@ def compute_downcore_mean_hu(state: StitchState) -> DowncoreProfile:
     posed, vol_b, mask_b = _posed_b_shifted(state)
     lag = state.total_lag_px
     col = state.total_col_offset_px
-    feather = max(4.0, 12.0 * state.spacing_mm)
 
-    # Establish canvas shape from mid Z
     z0 = posed.n_slices // 2
-    ca0, cb0, ma0, mb0 = compose_canvases(
+    ca0, _cb0, ma0, mb0 = compose_canvases(
         posed.vol_a[z0],
         posed.mask_a[z0],
         vol_b[z0],
@@ -654,79 +751,186 @@ def compute_downcore_mean_hu(state: StitchState) -> DowncoreProfile:
         cval=state.fixed.air,
     )
     h, w = ca0.shape
-    sum_hu = np.zeros(h, dtype=np.float64)
-    count = np.zeros(h, dtype=np.float64)
+    _ = (ma0, mb0)
 
-    use_m3 = (
-        sed.mask_3d is not None
-        and sed.mask_3d.shape[0] == posed.n_slices
-        and sed.mask_3d.shape[1] == h
-        and sed.mask_3d.shape[2] == w
-    )
+    want_filter = bool(sed.exclude_low or sed.exclude_high)
+    need_otsu = want_filter and (recompute_otsu or not sed.has_thresholds)
+    method = "mask_3d_stack" if sed.mask_3d is not None else "cylinder_chord_stack"
 
-    for z in range(posed.n_slices):
-        ca, cb, ma, mb = compose_canvases(
-            posed.vol_a[z],
-            posed.mask_a[z],
-            vol_b[z],
-            mask_b[z],
-            lag,
-            col_offset_px=col,
-            cval=state.fixed.air,
-        )
-        fused = fuse_preview(
-            ca,
-            cb,
-            ma,
-            mb,
-            opacity_a=1.0,
-            opacity_b=1.0,
-            mode=state.fuse_mode,
-            feather_mm=feather,
-            spacing_mm=state.spacing_mm,
-            match_hu=state.match_hu,
-        )
-        if use_m3:
-            sm = sed.mask_3d[z]  # type: ignore[index]
-        else:
-            sm = build_sediment_mask_2d(
-                ma | mb,
-                center_col_px=sed.center_col_px,
-                radius_mm=sed.radius_mm,
-                spacing_mm=state.spacing_mm,
-                erode_mm=sed.erode_mm,
-                nudge_x_mm=sed.nudge_x_mm,
-                view_z=float(z),
-                center_z=sed.center_z,
-                spacing_z_mm=posed.z_mm,
-                nudge_z_mm=sed.nudge_z_mm,
+    hist = np.zeros(HU_HIST_BINS, dtype=np.float64)
+    sum_raw = np.zeros(h, dtype=np.float64)
+    count_raw = np.zeros(h, dtype=np.float64)
+    sum_f = np.zeros(h, dtype=np.float64)
+    count_f = np.zeros(h, dtype=np.float64)
+    n_low = n_mid = n_high = 0
+
+    def _accum_slice(
+        fused: np.ndarray,
+        sm: np.ndarray,
+        *,
+        thr_lo: float | None,
+        thr_hi: float | None,
+        do_raw: bool,
+        do_filter: bool,
+        do_hist: bool,
+    ) -> None:
+        nonlocal n_low, n_mid, n_high
+        if do_raw:
+            _mean, cnt = mean_hu_per_row(fused, sm)
+            ok = cnt > 0
+            sum_raw[ok] += _mean[ok] * cnt[ok]
+            count_raw[ok] += cnt[ok]
+        if do_hist and sm.any():
+            hist[:] += np.histogram(
+                fused[sm], bins=HU_HIST_BINS, range=(HU_HIST_LO, HU_HIST_HI)
+            )[0]
+        if do_filter and thr_lo is not None and thr_hi is not None:
+            include, low, high = class_masks_from_hu(
+                fused,
+                sm,
+                thr_lo=float(thr_lo),
+                thr_hi=float(thr_hi),
+                exclude_low=sed.exclude_low,
+                exclude_high=sed.exclude_high,
             )
-        _mean, cnt = mean_hu_per_row(fused, sm)
-        ok = cnt > 0
-        sum_hu[ok] += _mean[ok] * cnt[ok]
-        count[ok] += cnt[ok]
+            n_low += int(low.sum())
+            n_high += int(high.sum())
+            n_mid += int((sm & ~low & ~high).sum())
+            _mf, cf = mean_hu_per_row(fused, include)
+            okf = cf > 0
+            sum_f[okf] += _mf[okf] * cf[okf]
+            count_f[okf] += cf[okf]
 
-    mean = np.full(h, np.nan, dtype=np.float64)
-    ok = count > 0
-    mean[ok] = sum_hu[ok] / count[ok]
+    # Pass A: raw (+ hist if Otsu); filter in-pass when thresholds already known
+    for z in range(posed.n_slices):
+        fused, sm = _cylinder_mask_at_z(
+            state,
+            z=z,
+            vol_b=vol_b,
+            mask_b=mask_b,
+            lag=lag,
+            col=col,
+            posed=posed,
+            h=h,
+            w=w,
+        )
+        _accum_slice(
+            fused,
+            sm,
+            thr_lo=sed.thr_lo_hu if not need_otsu else None,
+            thr_hi=sed.thr_hi_hu if not need_otsu else None,
+            do_raw=True,
+            do_filter=want_filter and not need_otsu and sed.has_thresholds,
+            do_hist=need_otsu,
+        )
+
+    mean_raw = np.full(h, np.nan, dtype=np.float64)
+    ok_r = count_raw > 0
+    mean_raw[ok_r] = sum_raw[ok_r] / count_raw[ok_r]
+
+    if need_otsu:
+        t0, t1 = multi_otsu_two_thresholds(hist)
+        sed.thr_lo_hu = t0
+        sed.thr_hi_hu = t1
+        sed.filter_method = "otsu3"
+        # Pass B: filtered means only (raw already done)
+        sum_f[:] = 0.0
+        count_f[:] = 0.0
+        n_low = n_mid = n_high = 0
+        for z in range(posed.n_slices):
+            fused, sm = _cylinder_mask_at_z(
+                state,
+                z=z,
+                vol_b=vol_b,
+                mask_b=mask_b,
+                lag=lag,
+                col=col,
+                posed=posed,
+                h=h,
+                w=w,
+            )
+            _accum_slice(
+                fused,
+                sm,
+                thr_lo=t0,
+                thr_hi=t1,
+                do_raw=False,
+                do_filter=True,
+                do_hist=False,
+            )
+    elif sed.filter_method == "none" and sed.has_thresholds:
+        sed.filter_method = "manual"
+
+    thr_lo = sed.thr_lo_hu
+    thr_hi = sed.thr_hi_hu
+    use_filter = want_filter and thr_lo is not None and thr_hi is not None
+
+    if use_filter:
+        method = method + "+hu_filter"
+        mean_f = np.full(h, np.nan, dtype=np.float64)
+        ok_f = count_f > 0
+        mean_f[ok_f] = sum_f[ok_f] / count_f[ok_f]
+        total = max(n_low + n_mid + n_high, 1)
+        sed.frac_low = n_low / total
+        sed.frac_high = n_high / total
+        sed.frac_mid = n_mid / total
+        excl = 0.0
+        if sed.exclude_low:
+            excl += float(sed.frac_low)
+        if sed.exclude_high:
+            excl += float(sed.frac_high)
+        rebuild_sediment_mask_2d(state)
+        return DowncoreProfile(
+            mean_hu=mean_f,
+            count=count_f.astype(np.int64),
+            spacing_mm=state.spacing_mm,
+            method=method,
+            mean_hu_raw=mean_raw,
+            count_raw=count_raw.astype(np.int64),
+            thr_lo_hu=float(thr_lo),
+            thr_hi_hu=float(thr_hi),
+            frac_excluded=float(excl),
+        )
+
+    sed.frac_low = sed.frac_high = sed.frac_mid = None
+    rebuild_sediment_mask_2d(state)
     return DowncoreProfile(
-        mean_hu=mean,
-        count=count.astype(np.int64),
+        mean_hu=mean_raw,
+        count=count_raw.astype(np.int64),
         spacing_mm=state.spacing_mm,
-        method="mask_3d_stack" if use_m3 else "cylinder_chord_stack",
+        method=method,
+        mean_hu_raw=None,
+        count_raw=None,
+        thr_lo_hu=thr_lo,
+        thr_hi_hu=thr_hi,
+        frac_excluded=0.0,
     )
 
 
-def ensure_downcore_profile(state: StitchState) -> DowncoreProfile:
-    """Return cached downcore profile, recomputing when pose/ROI changes."""
+def ensure_downcore_profile(
+    state: StitchState,
+    *,
+    recompute_otsu: bool = False,
+) -> DowncoreProfile:
+    """Return cached downcore profile, recomputing when pose/ROI/filter changes."""
+    if recompute_otsu and state.sediment is not None:
+        state.sediment.thr_lo_hu = None
+        state.sediment.thr_hi_hu = None
+        state.sediment.filter_method = "none"
+        state._downcore_cache_key = None
+        state._downcore_profile = None
     key = _downcore_cache_key(state)
     if key is None:
         raise ValueError("No sediment ROI — run Auto sediment first")
-    if state._downcore_profile is not None and state._downcore_cache_key == key:
+    if (
+        not recompute_otsu
+        and state._downcore_profile is not None
+        and state._downcore_cache_key == key
+    ):
         return state._downcore_profile
-    prof = compute_downcore_mean_hu(state)
+    prof = compute_downcore_mean_hu(state, recompute_otsu=recompute_otsu)
     state._downcore_profile = prof
-    state._downcore_cache_key = key
+    state._downcore_cache_key = _downcore_cache_key(state)
     return prof
 
 
@@ -766,13 +970,23 @@ def preview_arrays(
         u8 = np.clip((fused - lo) / (hi - lo) * 255.0, 0, 255).astype(np.uint8)
         union = state.mask_a | state.mask_b
         out = np.where(union, u8, 0).astype(np.uint8)
-    if (
-        show_sed
-        and state.sediment is not None
-        and state.sediment.mask_2d is not None
-        and state.sediment.mask_2d.any()
-    ):
-        out = overlay_sediment_rgb(out, state.sediment.mask_2d)
+    if show_sed and state.sediment is not None:
+        sed = state.sediment
+        if (
+            sed.has_thresholds
+            and sed.mask_include_2d is not None
+            and sed.mask_include_2d.any()
+        ):
+            out = overlay_sediment_classes_rgb(
+                out,
+                include=sed.mask_include_2d,
+                low=sed.mask_low_2d,
+                high=sed.mask_high_2d,
+                show_low=sed.exclude_low,
+                show_high=sed.exclude_high,
+            )
+        elif sed.mask_2d is not None and sed.mask_2d.any():
+            out = overlay_sediment_rgb(out, sed.mask_2d)
 
     box = (0, out.shape[0], 0, out.shape[1])
     if crop_core:
@@ -1308,6 +1522,14 @@ def sidecar_dict(state: StitchState) -> dict:
             "void_hu": state.sediment.void_hu,
             "method": state.sediment.method,
             "note": state.sediment.note,
+            "thr_lo_hu": state.sediment.thr_lo_hu,
+            "thr_hi_hu": state.sediment.thr_hi_hu,
+            "exclude_low": state.sediment.exclude_low,
+            "exclude_high": state.sediment.exclude_high,
+            "filter_method": state.sediment.filter_method,
+            "frac_low": state.sediment.frac_low,
+            "frac_mid": state.sediment.frac_mid,
+            "frac_high": state.sediment.frac_high,
             "has_mask_2d": bool(
                 state.sediment.mask_2d is not None and state.sediment.mask_2d.any()
             ),

@@ -89,13 +89,20 @@ class StitchGui(tk.Tk):
         self.export_sediment_roi = tk.BooleanVar(value=False)
         self.show_sediment = tk.BooleanVar(value=True)
         self.show_downcore = tk.BooleanVar(value=False)
+        self.exclude_low = tk.BooleanVar(value=True)
+        self.exclude_high = tk.BooleanVar(value=True)
         self.sed_erode = tk.DoubleVar(value=0.0)
         self.sed_nudge_x = tk.DoubleVar(value=0.0)
         self.sed_nudge_z = tk.DoubleVar(value=0.0)
+        self.thr_lo = tk.DoubleVar(value=-200.0)
+        self.thr_hi = tk.DoubleVar(value=800.0)
         self.sed_label = tk.StringVar(value="Sediment ROI: not detected")
+        self.filter_label = tk.StringVar(value="HU filter: not run")
         self.liner_preset = tk.StringVar(value="Auto (no prior)")
         self.liner_od = tk.DoubleVar(value=70.0)
         self.liner_wall = tk.DoubleVar(value=3.0)
+        self._thr_job: str | None = None
+        self._ignore_thr_slide = False
         self.xz_y_frac = tk.DoubleVar(value=0.5)
         self.xz_label = tk.StringVar(value="XZ: idle (builds after Z stack)")
         self.win_lo = tk.DoubleVar(value=0.0)
@@ -106,6 +113,7 @@ class StitchGui(tk.Tk):
         self._sed_job: str | None = None
         self._xz_job: str | None = None
         self._downcore_job: str | None = None
+        self._downcore_recompute_otsu: bool = False
         self._z_load_job: str | None = None
         self._hist_range: tuple[float, float] = (0.0, 1.0)
         self._hist_counts: np.ndarray | None = None
@@ -484,6 +492,50 @@ class StitchGui(tk.Tk):
         ttk.Label(parent, textvariable=self.sed_label, wraplength=320).pack(
             anchor=tk.W, pady=(6, 0)
         )
+
+        filt = ttk.LabelFrame(parent, text="Void / clast HU filter", padding=6)
+        filt.pack(fill=tk.X, pady=(10, 0))
+        ttk.Checkbutton(
+            filt,
+            text="Exclude lows (voids)",
+            variable=self.exclude_low,
+            command=self._on_filter_toggle,
+        ).pack(anchor=tk.W)
+        ttk.Checkbutton(
+            filt,
+            text="Exclude highs (clasts)",
+            variable=self.exclude_high,
+            command=self._on_filter_toggle,
+        ).pack(anchor=tk.W)
+        ttk.Button(
+            filt, text="Auto thresholds (Otsu)", command=self._run_otsu
+        ).pack(fill=tk.X, pady=(6, 4))
+        ttk.Label(filt, textvariable=self.filter_label, wraplength=300, font=("", 8)).pack(
+            anchor=tk.W
+        )
+        ttk.Label(filt, text="Thr lo (HU)", font=("", 8)).pack(anchor=tk.W, pady=(4, 0))
+        ttk.Scale(
+            filt,
+            from_=-800.0,
+            to=1500.0,
+            variable=self.thr_lo,
+            command=self._on_thr_slide,
+        ).pack(fill=tk.X)
+        ttk.Label(filt, text="Thr hi (HU)", font=("", 8)).pack(anchor=tk.W, pady=(4, 0))
+        ttk.Scale(
+            filt,
+            from_=-800.0,
+            to=2500.0,
+            variable=self.thr_hi,
+            command=self._on_thr_slide,
+        ).pack(fill=tk.X)
+        ttk.Label(
+            filt,
+            text="Green=included · cyan=void · orange=clast. "
+            "Faint plot line = raw cylinder mean.",
+            font=("", 8),
+            wraplength=300,
+        ).pack(anchor=tk.W, pady=(4, 0))
 
         er = ttk.LabelFrame(parent, text="Erode inward (mm)", padding=6)
         er.pack(fill=tk.X, pady=(10, 0))
@@ -1013,6 +1065,7 @@ class StitchGui(tk.Tk):
     def _sync_sediment_label(self) -> None:
         if self.state is None or self.state.sediment is None:
             self.sed_label.set("Sediment ROI: not detected")
+            self.filter_label.set("HU filter: not run")
             return
         s = self.state.sediment
         liner = f"{s.liner_hu:.0f}" if s.liner_hu is not None else "?"
@@ -1022,6 +1075,42 @@ class StitchGui(tk.Tk):
             f"R={s.effective_radius_mm:.1f} mm (auto {s.radius_mm:.1f} − erode "
             f"{s.erode_mm:.1f}) · liner≈{liner} void≈{void} HU · {s.note}{z3}"
         )
+        self._sync_filter_label()
+
+    def _sync_filter_label(self) -> None:
+        if self.state is None or self.state.sediment is None:
+            self.filter_label.set("HU filter: not run")
+            return
+        s = self.state.sediment
+        if not s.has_thresholds:
+            self.filter_label.set("HU filter: run Auto thresholds (Otsu)")
+            return
+        excl = []
+        if s.exclude_low:
+            excl.append("lows")
+        if s.exclude_high:
+            excl.append("highs")
+        excl_s = "+".join(excl) if excl else "none"
+        fr = ""
+        if s.frac_low is not None and s.frac_high is not None:
+            fr = f" · void {100 * s.frac_low:.0f}% clast {100 * s.frac_high:.0f}%"
+        self.filter_label.set(
+            f"lo={s.thr_lo_hu:.0f} · hi={s.thr_hi_hu:.0f} HU ({s.filter_method}) "
+            f"· exclude {excl_s}{fr}"
+        )
+
+    def _sync_thr_vars_from_state(self) -> None:
+        if self.state is None or self.state.sediment is None:
+            return
+        s = self.state.sediment
+        if not s.has_thresholds:
+            return
+        self._ignore_thr_slide = True
+        try:
+            self.thr_lo.set(float(s.thr_lo_hu))  # type: ignore[arg-type]
+            self.thr_hi.set(float(s.thr_hi_hu))  # type: ignore[arg-type]
+        finally:
+            self._ignore_thr_slide = False
 
     def _on_liner_preset(self) -> None:
         key = str(self.liner_preset.get())
@@ -1058,6 +1147,8 @@ class StitchGui(tk.Tk):
         self.sed_erode.set(sed.erode_mm)
         self.sed_nudge_x.set(sed.nudge_x_mm)
         self.sed_nudge_z.set(sed.nudge_z_mm)
+        self.exclude_low.set(sed.exclude_low)
+        self.exclude_high.set(sed.exclude_high)
         self.state.show_sediment = bool(self.show_sediment.get())
         self.state.show_downcore_plot = bool(self.show_downcore.get())
         invalidate_downcore_profile(self.state)
@@ -1067,8 +1158,17 @@ class StitchGui(tk.Tk):
         )
         self._schedule_refresh()
         self._schedule_xz_refresh(delay_ms=200)
-        if bool(self.show_downcore.get()):
+        if self._want_analysis_compute():
             self._schedule_downcore_compute()
+
+    def _want_analysis_compute(self) -> bool:
+        if self.state is None or self.state.sediment is None:
+            return False
+        return bool(
+            self.show_downcore.get()
+            or self.exclude_low.get()
+            or self.exclude_high.get()
+        )
 
     def _on_show_sediment(self) -> None:
         if self.state is not None:
@@ -1083,6 +1183,60 @@ class StitchGui(tk.Tk):
         if bool(self.show_downcore.get()):
             self._schedule_downcore_compute()
 
+    def _on_filter_toggle(self) -> None:
+        if self.state is None or self.state.sediment is None:
+            return
+        self.state.sediment.exclude_low = bool(self.exclude_low.get())
+        self.state.sediment.exclude_high = bool(self.exclude_high.get())
+        invalidate_downcore_profile(self.state)
+        self._sync_filter_label()
+        self._schedule_refresh()
+        if self._want_analysis_compute():
+            self._schedule_downcore_compute(delay_ms=100)
+
+    def _run_otsu(self) -> None:
+        if self.state is None or self.state.sediment is None:
+            messagebox.showinfo("Analyze", "Run Auto sediment first.")
+            return
+        self.state.sediment.exclude_low = bool(self.exclude_low.get())
+        self.state.sediment.exclude_high = bool(self.exclude_high.get())
+        self.status.set("Running multi-Otsu on cylinder HU…")
+        self._schedule_downcore_compute(delay_ms=50, recompute_otsu=True)
+
+    def _on_thr_slide(self, _value: str | None = None) -> None:
+        if self._ignore_thr_slide:
+            return
+        if self._thr_job is not None:
+            self.after_cancel(self._thr_job)
+        self._thr_job = self.after(120, self._apply_thr_manual)
+
+    def _apply_thr_manual(self) -> None:
+        self._thr_job = None
+        if self.state is None or self.state.sediment is None:
+            return
+        lo = float(self.thr_lo.get())
+        hi = float(self.thr_hi.get())
+        if hi < lo:
+            lo, hi = hi, lo
+            self._ignore_thr_slide = True
+            try:
+                self.thr_lo.set(lo)
+                self.thr_hi.set(hi)
+            finally:
+                self._ignore_thr_slide = False
+        sed = self.state.sediment
+        sed.thr_lo_hu = lo
+        sed.thr_hi_hu = hi
+        sed.filter_method = "manual"
+        sed.exclude_low = bool(self.exclude_low.get())
+        sed.exclude_high = bool(self.exclude_high.get())
+        invalidate_downcore_profile(self.state)
+        rebuild_sediment_mask_2d(self.state)
+        self._sync_filter_label()
+        self._schedule_refresh()
+        if self._want_analysis_compute():
+            self._schedule_downcore_compute(delay_ms=80)
+
     def _on_sediment_adjust(self, _value: str | None = None) -> None:
         if self._sed_job is not None:
             self.after_cancel(self._sed_job)
@@ -1096,12 +1250,16 @@ class StitchGui(tk.Tk):
         self.state.sediment.nudge_x_mm = float(self.sed_nudge_x.get())
         self.state.sediment.nudge_z_mm = float(self.sed_nudge_z.get())
         self.state.sediment.mask_3d = None  # invalidate volume mask
+        # Geometry change → clear Otsu until recomputed
+        self.state.sediment.thr_lo_hu = None
+        self.state.sediment.thr_hi_hu = None
+        self.state.sediment.filter_method = "none"
         invalidate_downcore_profile(self.state)
         rebuild_sediment_mask_2d(self.state)
         self._sync_sediment_label()
         self._schedule_refresh()
         self._schedule_xz_refresh(delay_ms=150)
-        if bool(self.show_downcore.get()):
+        if self._want_analysis_compute():
             self._schedule_downcore_compute(delay_ms=200)
 
     def _reset_sediment_nudge(self) -> None:
@@ -1250,31 +1408,55 @@ class StitchGui(tk.Tk):
             self.after_cancel(self._xz_job)
         self._xz_job = self.after(delay_ms, self._refresh_xz)
 
-    def _schedule_downcore_compute(self, delay_ms: int = 100) -> None:
+    def _schedule_downcore_compute(
+        self, delay_ms: int = 100, *, recompute_otsu: bool = False
+    ) -> None:
         if self._downcore_job is not None:
             self.after_cancel(self._downcore_job)
+        self._downcore_recompute_otsu = recompute_otsu
         self._downcore_job = self.after(delay_ms, self._compute_downcore)
 
     def _compute_downcore(self) -> None:
-        """Heavy stack average — runs after the coronal image has painted."""
+        """Heavy stack average / Otsu — runs after the coronal image has painted."""
         self._downcore_job = None
+        recompute_otsu = bool(getattr(self, "_downcore_recompute_otsu", False))
+        self._downcore_recompute_otsu = False
         if self.state is None or self.state.sediment is None:
             return
-        if not bool(self.show_downcore.get()):
+        if not recompute_otsu and not self._want_analysis_compute():
             return
         if self.state.posed is None:
-            self.status.set("Downcore plot waiting for Z stack…")
-            self._schedule_downcore_compute(delay_ms=400)
+            self.status.set("Analysis waiting for Z stack…")
+            self._schedule_downcore_compute(
+                delay_ms=400, recompute_otsu=recompute_otsu
+            )
             return
-        self.status.set("Computing downcore mean HU (all Z)…")
+        self.state.sediment.exclude_low = bool(self.exclude_low.get())
+        self.state.sediment.exclude_high = bool(self.exclude_high.get())
+        self.state.show_downcore_plot = bool(self.show_downcore.get())
+        msg = (
+            "Running multi-Otsu + downcore mean HU…"
+            if recompute_otsu
+            else "Computing downcore mean HU (all Z)…"
+        )
+        self.status.set(msg)
         self.update_idletasks()
         try:
-            prof = ensure_downcore_profile(self.state)
+            prof = ensure_downcore_profile(
+                self.state, recompute_otsu=recompute_otsu
+            )
         except Exception as exc:
             self.status.set(f"Downcore HU failed: {exc}")
             return
+        self._sync_thr_vars_from_state()
+        self._sync_filter_label()
         n_ok = int(np.isfinite(prof.mean_hu).sum())
-        self.status.set(f"Downcore mean HU ready ({n_ok} rows) — plot right of core.")
+        extra = ""
+        if prof.frac_excluded is not None and prof.frac_excluded > 0.005:
+            extra = f" · excluded {100 * prof.frac_excluded:.0f}%"
+        if prof.thr_lo_hu is not None:
+            extra += f" · thr {prof.thr_lo_hu:.0f}–{prof.thr_hi_hu:.0f}"
+        self.status.set(f"Downcore mean HU ready ({n_ok} rows){extra}")
         self._schedule_refresh()
 
     def _on_xz_y_slide(self, _value: str | None = None) -> None:
@@ -1391,11 +1573,11 @@ class StitchGui(tk.Tk):
                 self._draw_histogram()
             except Exception:
                 pass
-        # If plot is on but cache empty, kick compute after paint (non-blocking path)
+        # Kick deferred analysis if needed and cache empty
         if (
-            bool(self.show_downcore.get())
-            and self.state.sediment is not None
+            self.state.sediment is not None
             and self.state._downcore_profile is None
+            and self._want_analysis_compute()
         ):
             self._schedule_downcore_compute(delay_ms=50)
 

@@ -18,6 +18,12 @@ LINER_PRESETS: dict[str, tuple[float | None, float | None]] = {
 }
 
 
+# HU histogram range for global multi-Otsu inside the cylinder
+HU_HIST_LO = -1000.0
+HU_HIST_HI = 3000.0
+HU_HIST_BINS = 400
+
+
 @dataclass
 class SedimentRoi:
     """Sediment ROI parameters + masks (whole-core cylinder / vertical band)."""
@@ -34,12 +40,29 @@ class SedimentRoi:
     void_hu: float | None = None
     method: str = "outside_in"
     note: str = ""
-    mask_2d: np.ndarray | None = None  # current canvas (H, W)
+    mask_2d: np.ndarray | None = None  # cylinder chord (H, W)
     mask_3d: np.ndarray | None = None  # (Z, H, W) if built
+    # Analysis filter (void / matrix / clast) inside cylinder
+    thr_lo_hu: float | None = None
+    thr_hi_hu: float | None = None
+    exclude_low: bool = True
+    exclude_high: bool = True
+    filter_method: str = "none"  # none | otsu3 | manual
+    frac_low: float | None = None
+    frac_high: float | None = None
+    frac_mid: float | None = None
+    # Current-Z class masks for overlay (inside cylinder)
+    mask_include_2d: np.ndarray | None = None
+    mask_low_2d: np.ndarray | None = None
+    mask_high_2d: np.ndarray | None = None
 
     @property
     def effective_radius_mm(self) -> float:
         return max(0.0, float(self.radius_mm) - float(self.erode_mm))
+
+    @property
+    def has_thresholds(self) -> bool:
+        return self.thr_lo_hu is not None and self.thr_hi_hu is not None
 
 
 def _column_profile(image: np.ndarray, mask: np.ndarray) -> np.ndarray:
@@ -316,6 +339,108 @@ def overlay_sediment_rgb(
     return np.clip(tint, 0, 255).astype(np.uint8)
 
 
+def multi_otsu_two_thresholds(
+    hist_counts: np.ndarray,
+    *,
+    hu_lo: float = HU_HIST_LO,
+    hu_hi: float = HU_HIST_HI,
+) -> tuple[float, float]:
+    """
+    Global 3-class multi-Otsu → (thr_lo, thr_hi) separating low|mid|high.
+
+    hist_counts: length = HU_HIST_BINS over [hu_lo, hu_hi].
+    """
+    from skimage.filters import threshold_multiotsu
+
+    counts = np.asarray(hist_counts, dtype=np.float64).ravel()
+    if counts.sum() < 64:
+        mid = 0.5 * (hu_lo + hu_hi)
+        return mid - 200.0, mid + 200.0
+    edges = np.linspace(hu_lo, hu_hi, counts.size + 1)
+    centers = 0.5 * (edges[:-1] + edges[1:])
+    # Ignore empty tail bins for stability
+    nz = counts > 0
+    if nz.sum() < 8:
+        mid = float(centers[int(np.argmax(counts))])
+        return mid - 200.0, mid + 200.0
+    try:
+        thr = threshold_multiotsu(classes=3, hist=(counts, centers))
+        t0, t1 = float(thr[0]), float(thr[1])
+    except Exception:
+        # Percentile fallback on reconstructed CDF
+        cdf = np.cumsum(counts)
+        cdf /= max(cdf[-1], 1.0)
+        t0 = float(centers[int(np.searchsorted(cdf, 0.25))])
+        t1 = float(centers[int(np.searchsorted(cdf, 0.75))])
+    if t1 < t0:
+        t0, t1 = t1, t0
+    if t1 - t0 < 1.0:
+        t1 = t0 + 1.0
+    return t0, t1
+
+
+def class_masks_from_hu(
+    image: np.ndarray,
+    cylinder_mask: np.ndarray,
+    *,
+    thr_lo: float,
+    thr_hi: float,
+    exclude_low: bool = True,
+    exclude_high: bool = True,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """
+    Split cylinder voxels into low / include / high masks.
+
+    include = mid band, plus lows/highs that are not excluded.
+    """
+    m = cylinder_mask.astype(bool)
+    hu = image.astype(np.float64)
+    low = m & (hu < thr_lo)
+    high = m & (hu > thr_hi)
+    mid = m & ~low & ~high
+    include = mid.copy()
+    if not exclude_low:
+        include |= low
+    if not exclude_high:
+        include |= high
+    return include, low, high
+
+
+def overlay_sediment_classes_rgb(
+    base: np.ndarray,
+    *,
+    include: np.ndarray,
+    low: np.ndarray | None = None,
+    high: np.ndarray | None = None,
+    show_low: bool = True,
+    show_high: bool = True,
+    alpha: float = 0.35,
+) -> np.ndarray:
+    """Green=included, cyan=void/low, orange=clast/high."""
+    if base.ndim == 2:
+        rgb = np.stack([base, base, base], axis=-1).astype(np.float32)
+    else:
+        rgb = base.astype(np.float32).copy()
+    h, w = rgb.shape[:2]
+
+    def _tint(mask: np.ndarray, color: tuple[float, float, float]) -> None:
+        nonlocal rgb
+        if mask is None or mask.shape != (h, w) or not mask.any():
+            return
+        for c, v in enumerate(color):
+            rgb[mask, c] = rgb[mask, c] * (1 - alpha) + v * alpha
+
+    _tint(include, (40, 220, 80))
+    if show_low and low is not None:
+        _tint(low & ~include, (40, 180, 220))
+    if show_high and high is not None:
+        _tint(high & ~include, (240, 140, 40))
+    if include.any():
+        edge = include ^ binary_erosion(include, iterations=1)
+        rgb[edge] = (40, 255, 80)
+    return np.clip(rgb, 0, 255).astype(np.uint8)
+
+
 def overlay_sediment_circle_xz(
     base: np.ndarray,
     *,
@@ -369,10 +494,15 @@ def overlay_sediment_circle_xz(
 class DowncoreProfile:
     """Mean HU along upright core axis (Y / rows) inside sediment ROI."""
 
-    mean_hu: np.ndarray  # (H,) float; NaN where no sediment voxels
-    count: np.ndarray  # (H,) int voxel counts
+    mean_hu: np.ndarray  # (H,) filtered (or raw if no exclusion)
+    count: np.ndarray  # (H,) voxel counts for mean_hu
     spacing_mm: float
     method: str = "cylinder_stack"
+    mean_hu_raw: np.ndarray | None = None  # cylinder-only mean for ghost plot
+    count_raw: np.ndarray | None = None
+    thr_lo_hu: float | None = None
+    thr_hi_hu: float | None = None
+    frac_excluded: float | None = None
 
     @property
     def n_rows(self) -> int:
@@ -413,21 +543,37 @@ def render_downcore_plot_rgb(
     h = row1 - row0
     w = max(48, int(width))
     mean = profile.mean_hu[row0:row1].astype(np.float64).copy()
-    if smooth_sigma_px > 0.5 and np.isfinite(mean).sum() > 8:
-        finite = np.isfinite(mean)
-        filled = mean.copy()
+    raw = None
+    if profile.mean_hu_raw is not None:
+        raw = profile.mean_hu_raw[row0:row1].astype(np.float64).copy()
+
+    def _smooth(arr: np.ndarray) -> np.ndarray:
+        if smooth_sigma_px <= 0.5 or np.isfinite(arr).sum() <= 8:
+            return arr
+        finite = np.isfinite(arr)
+        filled = arr.copy()
         idx = np.arange(h)
-        if finite.any():
-            filled[~finite] = np.interp(idx[~finite], idx[finite], mean[finite])
-            sm = gaussian_filter1d(filled, sigma=smooth_sigma_px, mode="nearest")
-            mean = np.where(finite, sm, np.nan)
+        filled[~finite] = np.interp(idx[~finite], idx[finite], arr[finite])
+        sm = gaussian_filter1d(filled, sigma=smooth_sigma_px, mode="nearest")
+        return np.where(finite, sm, np.nan)
+
+    mean = _smooth(mean)
+    if raw is not None:
+        raw = _smooth(raw)
 
     finite = mean[np.isfinite(mean)]
+    if finite.size == 0 and raw is not None:
+        finite = raw[np.isfinite(raw)]
     if finite.size == 0:
         return np.full((h, w, 3), 18, dtype=np.uint8)
     if hu_lo is None or hu_hi is None:
         lo = float(np.nanpercentile(finite, 2))
         hi = float(np.nanpercentile(finite, 98))
+        if raw is not None:
+            rf = raw[np.isfinite(raw)]
+            if rf.size:
+                lo = min(lo, float(np.nanpercentile(rf, 2)))
+                hi = max(hi, float(np.nanpercentile(rf, 98)))
     else:
         lo, hi = float(hu_lo), float(hu_hi)
     if hi <= lo:
@@ -453,23 +599,31 @@ def render_downcore_plot_rgb(
             draw.text((max(0, xp - 8), 2), f"{hu:.0f}", fill=(150, 150, 160), font=font)
 
     if font is not None:
-        draw.text((pad_l, h - 12), "← HU →", fill=(140, 140, 150), font=font)
+        label = "mean HU"
+        if profile.frac_excluded is not None and profile.frac_excluded > 0.005:
+            label = f"filt (−{100 * profile.frac_excluded:.0f}%)"
+        draw.text((pad_l, h - 12), label, fill=(140, 140, 150), font=font)
 
-    pts: list[tuple[int, int]] = []
-    for i, v in enumerate(mean):
-        if not np.isfinite(v):
-            if len(pts) >= 2:
-                draw.line(pts, fill=(120, 220, 160), width=2)
-            pts = []
-            continue
-        t = float(np.clip((float(v) - lo) / (hi - lo), 0.0, 1.0))
-        xp = x0 + int(round(t * (x1 - x0)))
-        pts.append((xp, i))
-    if len(pts) >= 2:
-        draw.line(pts, fill=(120, 220, 160), width=2)
-    elif len(pts) == 1:
-        draw.ellipse(
-            [pts[0][0] - 1, pts[0][1] - 1, pts[0][0] + 1, pts[0][1] + 1],
-            fill=(120, 220, 160),
-        )
+    def _polyline(arr: np.ndarray, color: tuple[int, int, int], width: int) -> None:
+        pts: list[tuple[int, int]] = []
+        for i, v in enumerate(arr):
+            if not np.isfinite(v):
+                if len(pts) >= 2:
+                    draw.line(pts, fill=color, width=width)
+                pts = []
+                continue
+            t = float(np.clip((float(v) - lo) / (hi - lo), 0.0, 1.0))
+            xp = x0 + int(round(t * (x1 - x0)))
+            pts.append((xp, i))
+        if len(pts) >= 2:
+            draw.line(pts, fill=color, width=width)
+        elif len(pts) == 1:
+            draw.ellipse(
+                [pts[0][0] - 1, pts[0][1] - 1, pts[0][0] + 1, pts[0][1] + 1],
+                fill=color,
+            )
+
+    if raw is not None:
+        _polyline(raw, (90, 90, 100), 1)
+    _polyline(mean, (120, 220, 160), 2)
     return np.asarray(im, dtype=np.uint8)
