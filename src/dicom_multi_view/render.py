@@ -35,6 +35,26 @@ def _nice_step_cm(extent_cm: float, target_ticks: int = 6) -> float:
     return 10.0 * base
 
 
+def _isotropic_size_px(
+    height_px: int,
+    width_px: int,
+    depth_mm_per_px: float,
+    across_mm_per_px: float,
+) -> tuple[int, int, float]:
+    """
+    Size for on-screen isotropic mm (1 display px = target_mm).
+
+    Uses the finer of row/col spacing so detail is preserved; the coarser
+    axis is stretched. Returns (out_h, out_w, target_mm).
+    """
+    d_mm = max(float(depth_mm_per_px), 1e-12)
+    a_mm = max(float(across_mm_per_px), 1e-12)
+    target_mm = min(d_mm, a_mm)
+    out_h = max(1, int(round(height_px * d_mm / target_mm)))
+    out_w = max(1, int(round(width_px * a_mm / target_mm)))
+    return out_h, out_w, target_mm
+
+
 def _draw_scale_bar_cm(
     height_px: int,
     depth_mm_per_px: float,
@@ -84,22 +104,34 @@ def compose_section_rgb(
     win_hi: float | None = None,
     max_height_px: int | None = BASE_MAX_HEIGHT_PX,
 ) -> Image.Image:
-    """Greyscale section + cm depth scale bar on the right."""
+    """
+    Greyscale section + cm depth scale bar on the right.
+
+    Resamples so on-screen aspect matches physical mm (depth vs across
+    spacing), then optionally caps height with a uniform scale so the bar
+    stays consistent with the image.
+    """
     if top_depth_cm is None:
         top_depth_cm = section.top_depth_cm
 
     u8 = hu_to_u8(section.image_hu, win_lo, win_hi)
-    h, w = u8.shape
+    h0, w0 = u8.shape
+    iso_h, iso_w, target_mm = _isotropic_size_px(
+        h0, w0, section.depth_mm_per_px, section.across_mm_per_px
+    )
     img = Image.fromarray(np.stack([u8, u8, u8], axis=-1), mode="RGB")
+    if iso_h != h0 or iso_w != w0:
+        img = img.resize((iso_w, iso_h), Image.Resampling.BILINEAR)
+
+    h, w = iso_h, iso_w
+    depth_mm_per_px = target_mm
 
     if max_height_px and h > max_height_px:
         scale = max_height_px / h
         new_w = max(1, int(round(w * scale)))
         img = img.resize((new_w, max_height_px), Image.Resampling.BILINEAR)
-        depth_mm_per_px = section.depth_mm_per_px / scale
+        depth_mm_per_px = target_mm / scale
         h, w = max_height_px, new_w
-    else:
-        depth_mm_per_px = section.depth_mm_per_px
 
     bar = _draw_scale_bar_cm(
         h,
