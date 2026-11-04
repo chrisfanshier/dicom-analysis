@@ -41,6 +41,10 @@ class LoadedSection:
     top_depth_cm: float = 0.0
     # If True, continuous sync will not overwrite top_depth_cm
     manual_top: bool = False
+    # Core sediment bounds as insets from image ends (cm). Scale ticks and
+    # continuous chaining use the span between these markers, not full image.
+    core_top_inset_cm: float = 0.0
+    core_bottom_inset_cm: float = 0.0
     # Greyscale display window (HU); None → auto 1–99% when composing
     win_lo: float | None = None
     win_hi: float | None = None
@@ -48,6 +52,30 @@ class LoadedSection:
     @property
     def depth_extent_cm(self) -> float:
         return self.depth_extent_mm / 10.0
+
+    @property
+    def core_length_cm(self) -> float:
+        """Sediment length between core-top and core-bottom markers (cm)."""
+        return max(
+            0.0,
+            self.depth_extent_cm - self.core_top_inset_cm - self.core_bottom_inset_cm,
+        )
+
+    def clamp_core_insets(self) -> None:
+        """Keep insets non-negative and within the image depth extent."""
+        extent = max(self.depth_extent_cm, 0.0)
+        top = max(0.0, float(self.core_top_inset_cm))
+        bottom = max(0.0, float(self.core_bottom_inset_cm))
+        if top + bottom > extent:
+            # Preserve ratio when both overshoot; otherwise clip the mover.
+            if extent <= 0:
+                top = bottom = 0.0
+            else:
+                scale = extent / (top + bottom)
+                top *= scale
+                bottom *= scale
+        self.core_top_inset_cm = top
+        self.core_bottom_inset_cm = bottom
 
     @property
     def display_label(self) -> str:
@@ -435,6 +463,8 @@ def set_plane(section: LoadedSection, plane_index: int) -> LoadedSection:
         section_name=section.section_name,
         top_depth_cm=section.top_depth_cm,
         manual_top=section.manual_top,
+        core_top_inset_cm=section.core_top_inset_cm,
+        core_bottom_inset_cm=section.core_bottom_inset_cm,
         win_lo=wlo,
         win_hi=whi,
     )
@@ -442,14 +472,15 @@ def set_plane(section: LoadedSection, plane_index: int) -> LoadedSection:
 
 def sync_continuous_tops(sections: list[LoadedSection]) -> None:
     """
-    Set non-manual tops so continuous depth = sum of image lengths in list order.
+    Set non-manual tops so continuous depth chains by core length in list order.
 
     running_cm starts at 0; each auto section gets top = running; then
-    running += extent. Manual tops are kept; running continues from
-    max(manual_top + extent, …) so following autos still chain after them.
+    running += core_length_cm (span between core-top / core-bottom markers).
+    Manual tops are kept; running continues from manual_top + core_length.
     """
     running = 0.0
     for sec in sections:
+        sec.clamp_core_insets()
         if not sec.manual_top:
             sec.top_depth_cm = running
-        running = sec.top_depth_cm + sec.depth_extent_cm
+        running = sec.top_depth_cm + sec.core_length_cm

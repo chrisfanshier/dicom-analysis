@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import tkinter as tk
+from dataclasses import dataclass
 from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
 
@@ -12,6 +13,7 @@ from PIL import Image, ImageTk
 
 from dicom_multi_view.render import (
     BASE_MAX_HEIGHT_PX,
+    ComposeLayout,
     compose_section_rgb,
     shared_mm_per_px,
     title_strip,
@@ -24,6 +26,16 @@ from dicom_multi_view.section import (
     suggest_labels,
     sync_continuous_tops,
 )
+
+
+@dataclass
+class SectionSheetLayout:
+    """Where a section's image sits on the pre-zoom base sheet."""
+
+    index: int
+    img_x0: int
+    img_y0: int
+    layout: ComposeLayout
 
 
 def _clip(v: float, lo: float, hi: float) -> float:
@@ -130,24 +142,28 @@ class MultiViewGui(tk.Tk):
         self.sections: list[LoadedSection] = []
         self._photo: ImageTk.PhotoImage | None = None
         self._base_sheet: Image.Image | None = None
+        self._sheet_layouts: list[SectionSheetLayout] = []
         self._zoom = 1.0
         self._min_zoom = 0.05
         self._max_zoom = 8.0
         self._rebuild_job: str | None = None
         self._plane_job: str | None = None
         self._win_job: str | None = None
+        self._marker_job: str | None = None
         self._ignore_plane = False
         self._ignore_top = False
+        self._ignore_insets = False
         self._ignore_window = False
         self._hist_range = (0.0, 1.0)
         self._hist_counts: np.ndarray | None = None
         self._hist_drag_which: str | None = None
+        self._marker_drag: tuple[int, str] | None = None  # (section_index, "top"|"bottom")
 
         self.status = tk.StringVar(
-            value="Add folder… · shared wheel-zoom / drag-pan · scale in cm"
+            value="Add folder… · drag cyan/amber core guides · shared zoom/pan · scale in cm"
         )
         self.layout_mode = tk.StringVar(value="side")  # side | stack
-        # continuous: tops from sum of lengths (manual tops respected)
+        # continuous: tops from sum of core lengths (manual tops respected)
         # per: each section uses its own top (default 0)
         self.scale_mode = tk.StringVar(value="continuous")
         self.plane_label = tk.StringVar(value="Cut / frame: —")
@@ -157,6 +173,9 @@ class MultiViewGui(tk.Tk):
         self.zoom_label = tk.StringVar(value="Zoom: 100% (shared)")
         self.top_depth_var = tk.StringVar(value="0")
         self.top_manual_var = tk.BooleanVar(value=False)
+        self.core_top_inset_var = tk.StringVar(value="0")
+        self.core_bottom_inset_var = tk.StringVar(value="0")
+        self.core_length_label = tk.StringVar(value="Core length: —")
         # Greyscale window: "section" = selected only; "all" = shared HU window
         self.window_scope = tk.StringVar(value="section")
         self.win_lo = tk.DoubleVar(value=0.0)
@@ -267,7 +286,7 @@ class MultiViewGui(tk.Tk):
         depth_fr.grid(row=4, column=0, sticky="ew", pady=(0, 6))
         ttk.Radiobutton(
             depth_fr,
-            text="Continuous — tops = sum of lengths in list order",
+            text="Continuous — tops = sum of core lengths in list order",
             variable=self.scale_mode,
             value="continuous",
             command=self._on_scale_mode,
@@ -296,6 +315,39 @@ class MultiViewGui(tk.Tk):
             variable=self.top_manual_var,
             command=self._apply_top_manual_flag,
         ).pack(anchor="w")
+
+        ttk.Separator(depth_fr, orient=tk.HORIZONTAL).pack(fill=tk.X, pady=6)
+        core_help = ttk.Label(
+            depth_fr,
+            text=(
+                "Core bounds — cyan (top) / amber (bottom) guides. "
+                "Insets from image ends; scale ticks & continuous chaining use the span between them."
+            ),
+            wraplength=380,
+        )
+        core_help.pack(anchor="w")
+        self._wrap_labels.append(core_help)
+
+        inset_top_row = ttk.Frame(depth_fr)
+        inset_top_row.pack(fill=tk.X, pady=(4, 0))
+        ttk.Label(inset_top_row, text="Top inset (cm)").pack(side=tk.LEFT)
+        top_in_e = ttk.Entry(inset_top_row, textvariable=self.core_top_inset_var, width=8)
+        top_in_e.pack(side=tk.LEFT, padx=6)
+        top_in_e.bind("<Return>", lambda _e: self._apply_insets_from_entry())
+        top_in_e.bind("<FocusOut>", lambda _e: self._apply_insets_from_entry())
+
+        inset_bot_row = ttk.Frame(depth_fr)
+        inset_bot_row.pack(fill=tk.X, pady=(2, 0))
+        ttk.Label(inset_bot_row, text="Bottom inset (cm)").pack(side=tk.LEFT)
+        bot_in_e = ttk.Entry(inset_bot_row, textvariable=self.core_bottom_inset_var, width=8)
+        bot_in_e.pack(side=tk.LEFT, padx=6)
+        bot_in_e.bind("<Return>", lambda _e: self._apply_insets_from_entry())
+        bot_in_e.bind("<FocusOut>", lambda _e: self._apply_insets_from_entry())
+
+        ttk.Label(depth_fr, textvariable=self.core_length_label).pack(anchor="w", pady=(4, 0))
+        ttk.Button(
+            depth_fr, text="Reset insets to image ends", command=self._reset_core_insets
+        ).pack(anchor="w", pady=(2, 0))
 
         layout_fr = ttk.LabelFrame(left, text="Layout", padding=6)
         layout_fr.grid(row=5, column=0, sticky="ew", pady=(0, 6))
@@ -410,8 +462,9 @@ class MultiViewGui(tk.Tk):
         self.canvas.bind("<MouseWheel>", self._on_mousewheel)
         self.canvas.bind("<Button-4>", lambda e: self._zoom_at(e.x, e.y, 1.15))
         self.canvas.bind("<Button-5>", lambda e: self._zoom_at(e.x, e.y, 1 / 1.15))
-        self.canvas.bind("<ButtonPress-1>", self._pan_start)
-        self.canvas.bind("<B1-Motion>", self._pan_move)
+        self.canvas.bind("<ButtonPress-1>", self._canvas_press)
+        self.canvas.bind("<B1-Motion>", self._canvas_drag)
+        self.canvas.bind("<ButtonRelease-1>", self._canvas_release)
         self.canvas.bind("<ButtonPress-2>", self._pan_start)
         self.canvas.bind("<B2-Motion>", self._pan_move)
 
@@ -578,7 +631,57 @@ class MultiViewGui(tk.Tk):
         self._rebuild_list()
         self._on_select()
         self.rebuild()
-        self.status.set("Continuous tops recalculated from image lengths (cm).")
+        self.status.set("Continuous tops recalculated from core lengths (cm).")
+
+    def _sync_inset_fields(self, sec: LoadedSection) -> None:
+        self._ignore_insets = True
+        self.core_top_inset_var.set(f"{sec.core_top_inset_cm:g}")
+        self.core_bottom_inset_var.set(f"{sec.core_bottom_inset_cm:g}")
+        self.core_length_label.set(
+            f"Core length: {sec.core_length_cm:.2f} cm  "
+            f"(image {sec.depth_extent_cm:.2f} cm)"
+        )
+        self._ignore_insets = False
+
+    def _apply_insets_from_entry(self) -> None:
+        if self._ignore_insets:
+            return
+        i = self._selected_index()
+        if i is None:
+            return
+        try:
+            top_in = float(self.core_top_inset_var.get().strip() or "0")
+            bot_in = float(self.core_bottom_inset_var.get().strip() or "0")
+        except ValueError:
+            return
+        sec = self.sections[i]
+        sec.core_top_inset_cm = max(0.0, top_in)
+        sec.core_bottom_inset_cm = max(0.0, bot_in)
+        sec.clamp_core_insets()
+        self._sync_inset_fields(sec)
+        if self.scale_mode.get() == "continuous":
+            sync_continuous_tops(self.sections)
+            self._rebuild_list()
+            self.listbox.selection_set(i)
+            self._ignore_top = True
+            self.top_depth_var.set(f"{sec.top_depth_cm:g}")
+            self._ignore_top = False
+        self.rebuild()
+
+    def _reset_core_insets(self) -> None:
+        i = self._selected_index()
+        if i is None:
+            return
+        sec = self.sections[i]
+        sec.core_top_inset_cm = 0.0
+        sec.core_bottom_inset_cm = 0.0
+        self._sync_inset_fields(sec)
+        if self.scale_mode.get() == "continuous":
+            sync_continuous_tops(self.sections)
+            self._rebuild_list()
+            self.listbox.selection_set(i)
+        self.rebuild()
+        self.status.set("Core insets reset to image ends (0 cm).")
 
     def _apply_top_from_entry(self) -> None:
         if self._ignore_top:
@@ -618,12 +721,14 @@ class MultiViewGui(tk.Tk):
         if i is None or not (0 <= i < len(self.sections)):
             self.plane_label.set("Cut / frame: —")
             self.win_label.set("Window: —")
+            self.core_length_label.set("Core length: —")
             return
         sec = self.sections[i]
         self._ignore_top = True
         self.top_depth_var.set(f"{sec.top_depth_cm:g}")
         self.top_manual_var.set(sec.manual_top)
         self._ignore_top = False
+        self._sync_inset_fields(sec)
 
         n = max(sec.plane_count - 1, 0)
         self._ignore_plane = True
@@ -859,7 +964,7 @@ class MultiViewGui(tk.Tk):
         self._ignore_window = False
         self._apply_window()
 
-    # ----- shared zoom / pan -----
+    # ----- shared zoom / pan / core guides -----
 
     def _pan_start(self, event) -> None:
         self.canvas.scan_mark(event.x, event.y)
@@ -867,6 +972,103 @@ class MultiViewGui(tk.Tk):
 
     def _pan_move(self, event) -> None:
         self.canvas.scan_dragto(event.x, event.y, gain=1)
+
+    def _marker_y_base(self, lay: SectionSheetLayout, which: str) -> float:
+        sec = self.sections[lay.index]
+        h = max(lay.layout.img_h, 1)
+        extent = max(sec.depth_extent_cm, 1e-12)
+        if which == "top":
+            return lay.img_y0 + (sec.core_top_inset_cm / extent) * h
+        return lay.img_y0 + h - 1 - (sec.core_bottom_inset_cm / extent) * h
+
+    def _hit_core_marker(self, event) -> tuple[int, str] | None:
+        """Return (section_index, 'top'|'bottom') if pointer is near a guide."""
+        if self._base_sheet is None or not self._sheet_layouts:
+            return None
+        z = max(self._zoom, 1e-9)
+        bx = self.canvas.canvasx(event.x) / z
+        by = self.canvas.canvasy(event.y) / z
+        thresh = max(5.0 / z, 0.5)
+        best: tuple[float, int, str] | None = None
+        for lay in self._sheet_layouts:
+            if not (lay.img_x0 <= bx <= lay.img_x0 + lay.layout.img_w):
+                continue
+            for which in ("top", "bottom"):
+                dy = abs(by - self._marker_y_base(lay, which))
+                if dy <= thresh and (best is None or dy < best[0]):
+                    best = (dy, lay.index, which)
+        if best is None:
+            return None
+        return best[1], best[2]
+
+    def _canvas_press(self, event) -> None:
+        hit = self._hit_core_marker(event)
+        if hit is not None:
+            self._marker_drag = hit
+            idx, which = hit
+            self.listbox.selection_clear(0, tk.END)
+            self.listbox.selection_set(idx)
+            self._on_select()
+            self.canvas.focus_set()
+            self.status.set(
+                f"Dragging core {'top' if which == 'top' else 'bottom'} guide…"
+            )
+            return
+        self._marker_drag = None
+        self._pan_start(event)
+
+    def _canvas_drag(self, event) -> None:
+        if self._marker_drag is None:
+            self._pan_move(event)
+            return
+        idx, which = self._marker_drag
+        if not (0 <= idx < len(self.sections)) or not self._sheet_layouts:
+            return
+        lay = next((L for L in self._sheet_layouts if L.index == idx), None)
+        if lay is None:
+            return
+        z = max(self._zoom, 1e-9)
+        by = self.canvas.canvasy(event.y) / z
+        h = max(lay.layout.img_h, 1)
+        extent = max(self.sections[idx].depth_extent_cm, 1e-12)
+        frac = (by - lay.img_y0) / h
+        frac = float(np.clip(frac, 0.0, 1.0))
+        sec = self.sections[idx]
+        if which == "top":
+            # Leave at least a tiny core; don't cross bottom marker.
+            max_top = max(0.0, extent - sec.core_bottom_inset_cm - 0.01)
+            sec.core_top_inset_cm = float(np.clip(frac * extent, 0.0, max_top))
+        else:
+            from_bottom = (1.0 - frac) * extent
+            max_bot = max(0.0, extent - sec.core_top_inset_cm - 0.01)
+            sec.core_bottom_inset_cm = float(np.clip(from_bottom, 0.0, max_bot))
+        sec.clamp_core_insets()
+        self._sync_inset_fields(sec)
+        if self._marker_job is not None:
+            self.after_cancel(self._marker_job)
+        self._marker_job = self.after(40, self._commit_marker_drag)
+
+    def _commit_marker_drag(self) -> None:
+        self._marker_job = None
+        if self.scale_mode.get() == "continuous":
+            sync_continuous_tops(self.sections)
+            i = self._selected_index()
+            self._rebuild_list()
+            if i is not None:
+                self.listbox.selection_set(i)
+                self._ignore_top = True
+                self.top_depth_var.set(f"{self.sections[i].top_depth_cm:g}")
+                self._ignore_top = False
+        self.rebuild()
+
+    def _canvas_release(self, _event) -> None:
+        if self._marker_drag is not None:
+            self._marker_drag = None
+            if self._marker_job is not None:
+                self.after_cancel(self._marker_job)
+                self._marker_job = None
+            self._commit_marker_drag()
+            self.status.set("Core bounds updated.")
 
     def _on_mousewheel(self, event) -> None:
         factor = 1.15 if event.delta > 0 else 1 / 1.15
@@ -958,6 +1160,7 @@ class MultiViewGui(tk.Tk):
         self.canvas.delete("all")
         self._photo = None
         self._base_sheet = None
+        self._sheet_layouts = []
         if not self.sections:
             self.canvas.create_text(
                 24,
@@ -975,15 +1178,17 @@ class MultiViewGui(tk.Tk):
             max_width_px=900,
         )
         tiles: list[Image.Image] = []
+        body_layouts: list[ComposeLayout] = []
+        title_hs: list[int] = []
         for sec in self.sections:
-            body = compose_section_rgb(
+            body, body_lay = compose_section_rgb(
                 sec,
                 top_depth_cm=sec.top_depth_cm,
                 mm_per_px=mm_px,
             )
             title = (
-                f"{sec.display_label}  ·  top {sec.top_depth_cm:g}–"
-                f"{sec.top_depth_cm + sec.depth_extent_cm:.1f} cm  ·  "
+                f"{sec.display_label}  ·  core {sec.top_depth_cm:g}–"
+                f"{sec.top_depth_cm + sec.core_length_cm:.1f} cm  ·  "
                 f"{sec.badge_geometry}  ·  {sec.badge_compression}"
             )
             head = title_strip(title, body.width)
@@ -991,26 +1196,58 @@ class MultiViewGui(tk.Tk):
             stacked.paste(head, (0, 0))
             stacked.paste(body, (0, head.height))
             tiles.append(stacked)
+            body_layouts.append(body_lay)
+            title_hs.append(head.height)
 
         gap = 12
         layout = self.layout_mode.get()
+        sheet_layouts: list[SectionSheetLayout] = []
         if layout == "side":
             total_w = sum(t.width for t in tiles) + gap * max(len(tiles) - 1, 0)
             total_h = max(t.height for t in tiles)
             sheet = Image.new("RGB", (total_w, total_h), (26, 26, 30))
             x = 0
-            for t in tiles:
+            for i, t in enumerate(tiles):
                 sheet.paste(t, (x, 0))
+                bl = body_layouts[i]
+                sheet_layouts.append(
+                    SectionSheetLayout(
+                        index=i,
+                        img_x0=x,
+                        img_y0=title_hs[i],
+                        layout=ComposeLayout(
+                            img_w=bl.img_w,
+                            img_h=bl.img_h,
+                            bar_width=bl.bar_width,
+                            title_h=title_hs[i],
+                        ),
+                    )
+                )
                 x += t.width + gap
         else:
             total_w = max(t.width for t in tiles)
             total_h = sum(t.height for t in tiles) + gap * max(len(tiles) - 1, 0)
             sheet = Image.new("RGB", (total_w, total_h), (26, 26, 30))
             y = 0
-            for t in tiles:
+            for i, t in enumerate(tiles):
                 sheet.paste(t, (0, y))
+                bl = body_layouts[i]
+                sheet_layouts.append(
+                    SectionSheetLayout(
+                        index=i,
+                        img_x0=0,
+                        img_y0=y + title_hs[i],
+                        layout=ComposeLayout(
+                            img_w=bl.img_w,
+                            img_h=bl.img_h,
+                            bar_width=bl.bar_width,
+                            title_h=title_hs[i],
+                        ),
+                    )
+                )
                 y += t.height + gap
         self._base_sheet = sheet
+        self._sheet_layouts = sheet_layouts
 
 
 def main(argv: list[str] | None = None) -> None:
