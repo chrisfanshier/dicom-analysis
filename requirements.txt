@@ -1,0 +1,3 @@
+# Runtime deps live in pyproject.toml. This file mirrors that for
+# `pip install -r requirements.txt` (same as `pip install -e .`).
+-e .

@@ -14,6 +14,12 @@ python -m venv .venv
 pip install -e .
 ```
 
+Deps are declared in `pyproject.toml` (`pip install -e .` or `pip install -r requirements.txt`).
+
+### Windows double-click (new machine)
+
+Do **not** copy `.venv` / `venv` between PCs. On a machine with Python 3.11+ on PATH, double-click `Run-DicomMultiView.bat`. First run creates `.venv` and installs deps; later runs reuse the venv. To force a reinstall: `set REINSTALL=1` then run the bat again.
+
 ## Run multi-view (MVP)
 
 ```bash
