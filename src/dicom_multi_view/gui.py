@@ -168,25 +168,71 @@ class MultiViewGui(tk.Tk):
             self.after(150, lambda: self._load_paths(initial_paths, prompt=True))
 
     def _build(self) -> None:
-        root = ttk.Frame(self)
-        root.pack(fill=tk.BOTH, expand=True)
-        root.columnconfigure(1, weight=1)
-        root.rowconfigure(0, weight=1)
+        # Horizontal splitter: left controls | image view
+        self.paned = tk.PanedWindow(
+            self,
+            orient=tk.HORIZONTAL,
+            sashrelief=tk.RAISED,
+            sashwidth=6,
+            bd=0,
+            opaqueresize=True,
+        )
+        self.paned.pack(fill=tk.BOTH, expand=True)
 
-        left = ttk.Frame(root, padding=(8, 8, 4, 4), width=350)
-        left.grid(row=0, column=0, sticky="nsw")
-        left.grid_propagate(False)
+        left_outer = ttk.Frame(self.paned)
+        self.paned.add(left_outer, minsize=320, width=420, stretch="never")
+
+        # Scrollable left control column (vertical scrollbar when content is tall)
+        self._left_canvas = tk.Canvas(
+            left_outer, highlightthickness=0, borderwidth=0, width=420
+        )
+        left_vsb = ttk.Scrollbar(
+            left_outer, orient=tk.VERTICAL, command=self._left_canvas.yview
+        )
+        self._left_canvas.configure(yscrollcommand=left_vsb.set)
+        left_vsb.pack(side=tk.RIGHT, fill=tk.Y)
+        self._left_canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+
+        left = ttk.Frame(self._left_canvas, padding=(8, 8, 8, 8))
+        self._left_window = self._left_canvas.create_window((0, 0), window=left, anchor="nw")
         left.columnconfigure(0, weight=1)
-        left.rowconfigure(3, weight=1)
+        self._wrap_labels: list[ttk.Label] = []
+
+        def _sync_left_scrollregion(_event: tk.Event | None = None) -> None:
+            self._left_canvas.configure(scrollregion=self._left_canvas.bbox("all"))
+
+        def _sync_left_width(event: tk.Event) -> None:
+            self._left_canvas.itemconfigure(self._left_window, width=event.width)
+            wrap = max(200, event.width - 28)
+            for lbl in self._wrap_labels:
+                lbl.configure(wraplength=wrap)
+
+        left.bind("<Configure>", _sync_left_scrollregion)
+        self._left_canvas.bind("<Configure>", _sync_left_width)
+
+        def _left_wheel_enter(_event: tk.Event) -> None:
+            self.bind_all("<MouseWheel>", self._on_left_mousewheel)
+            self.bind_all("<Button-4>", self._on_left_button4)
+            self.bind_all("<Button-5>", self._on_left_button5)
+
+        def _left_wheel_leave(_event: tk.Event) -> None:
+            self.unbind_all("<MouseWheel>")
+            self.unbind_all("<Button-4>")
+            self.unbind_all("<Button-5>")
+
+        left_outer.bind("<Enter>", _left_wheel_enter)
+        left_outer.bind("<Leave>", _left_wheel_leave)
 
         ttk.Label(left, text="dicom-multi-view", font=("", 12, "bold")).grid(
             row=0, column=0, sticky="w", pady=(0, 2)
         )
-        ttk.Label(
+        subtitle = ttk.Label(
             left,
             text="Sediment core sections — view only (no stitch / export)",
-            wraplength=320,
-        ).grid(row=1, column=0, sticky="w", pady=(0, 8))
+            wraplength=380,
+        )
+        subtitle.grid(row=1, column=0, sticky="ew", pady=(0, 8))
+        self._wrap_labels.append(subtitle)
 
         actions = ttk.Frame(left)
         actions.grid(row=2, column=0, sticky="ew", pady=(0, 6))
@@ -207,11 +253,10 @@ class MultiViewGui(tk.Tk):
         )
 
         list_fr = ttk.LabelFrame(left, text="Sections (order)", padding=4)
-        list_fr.grid(row=3, column=0, sticky="nsew", pady=(0, 6))
-        list_fr.rowconfigure(0, weight=1)
+        list_fr.grid(row=3, column=0, sticky="ew", pady=(0, 6))
         list_fr.columnconfigure(0, weight=1)
-        self.listbox = tk.Listbox(list_fr, exportselection=False, height=9)
-        self.listbox.grid(row=0, column=0, sticky="nsew")
+        self.listbox = tk.Listbox(list_fr, exportselection=False, height=8)
+        self.listbox.grid(row=0, column=0, sticky="ew")
         sb = ttk.Scrollbar(list_fr, orient=tk.VERTICAL, command=self.listbox.yview)
         sb.grid(row=0, column=1, sticky="ns")
         self.listbox.configure(yscrollcommand=sb.set)
@@ -267,15 +312,19 @@ class MultiViewGui(tk.Tk):
 
         plane_fr = ttk.LabelFrame(left, text="Cut / frame (selected)", padding=6)
         plane_fr.grid(row=6, column=0, sticky="ew", pady=(0, 6))
-        ttk.Label(plane_fr, textvariable=self.plane_label, wraplength=320).pack(anchor="w")
+        plane_lbl = ttk.Label(plane_fr, textvariable=self.plane_label, wraplength=380)
+        plane_lbl.pack(anchor="w")
+        self._wrap_labels.append(plane_lbl)
         self.plane_scale = ttk.Scale(
             plane_fr, from_=0, to=1, orient=tk.HORIZONTAL, command=self._on_plane_slide
         )
         self.plane_scale.pack(fill=tk.X, pady=4)
         ttk.Button(plane_fr, text="Mid cut", command=self._plane_mid).pack(anchor="w")
-        ttk.Label(plane_fr, textvariable=self.plane_help, wraplength=320).pack(
-            anchor="w", pady=(4, 0)
+        plane_help_lbl = ttk.Label(
+            plane_fr, textvariable=self.plane_help, wraplength=380
         )
+        plane_help_lbl.pack(anchor="w", pady=(4, 0))
+        self._wrap_labels.append(plane_help_lbl)
 
         win_fr = ttk.LabelFrame(left, text="Greyscale window (HU)", padding=6)
         win_fr.grid(row=7, column=0, sticky="ew", pady=(0, 6))
@@ -318,7 +367,9 @@ class MultiViewGui(tk.Tk):
         wb = ttk.Frame(win_fr)
         wb.pack(fill=tk.X, pady=(4, 0))
         ttk.Button(wb, text="Auto 1–99%", command=self._auto_window).pack(side=tk.LEFT)
-        ttk.Label(win_fr, textvariable=self.win_label, wraplength=320).pack(anchor="w")
+        win_lbl = ttk.Label(win_fr, textvariable=self.win_label, wraplength=380)
+        win_lbl.pack(anchor="w")
+        self._wrap_labels.append(win_lbl)
 
         view_fr = ttk.LabelFrame(left, text="View (shared)", padding=6)
         view_fr.grid(row=8, column=0, sticky="ew", pady=(0, 6))
@@ -331,18 +382,20 @@ class MultiViewGui(tk.Tk):
             side=tk.LEFT, padx=(0, 2)
         )
         ttk.Button(vr, text="Zoom −", command=lambda: self._zoom_by(1 / 1.25)).pack(side=tk.LEFT)
-        ttk.Label(
+        view_help = ttk.Label(
             view_fr,
             text="Wheel zooms toward cursor · drag pans · shared physical cm scale + zoom",
-            wraplength=320,
-        ).pack(anchor="w", pady=(4, 0))
-
-        ttk.Label(left, textvariable=self.status, wraplength=320).grid(
-            row=9, column=0, sticky="ew"
+            wraplength=380,
         )
+        view_help.pack(anchor="w", pady=(4, 0))
+        self._wrap_labels.append(view_help)
 
-        right = ttk.Frame(root, padding=(4, 8, 8, 4))
-        right.grid(row=0, column=1, sticky="nsew")
+        status_lbl = ttk.Label(left, textvariable=self.status, wraplength=380)
+        status_lbl.grid(row=9, column=0, sticky="ew")
+        self._wrap_labels.append(status_lbl)
+
+        right = ttk.Frame(self.paned, padding=(4, 8, 8, 4))
+        self.paned.add(right, minsize=400, stretch="always")
         right.rowconfigure(0, weight=1)
         right.columnconfigure(0, weight=1)
 
@@ -361,6 +414,30 @@ class MultiViewGui(tk.Tk):
         self.canvas.bind("<B1-Motion>", self._pan_move)
         self.canvas.bind("<ButtonPress-2>", self._pan_start)
         self.canvas.bind("<B2-Motion>", self._pan_move)
+
+        # Place sash after geometry is realized (~420 px left panel)
+        self.after_idle(lambda: self._set_left_sash(420))
+
+    def _set_left_sash(self, width: int) -> None:
+        try:
+            self.paned.sash_place(0, width, 1)
+        except tk.TclError:
+            pass
+
+    def _on_left_mousewheel(self, event: tk.Event) -> str | None:
+        """Scroll the left control pane while the pointer is over it."""
+        delta = getattr(event, "delta", 0)
+        if delta:
+            self._left_canvas.yview_scroll(int(-delta / 120), "units")
+        return "break"
+
+    def _on_left_button4(self, _event: tk.Event) -> str | None:
+        self._left_canvas.yview_scroll(-1, "units")
+        return "break"
+
+    def _on_left_button5(self, _event: tk.Event) -> str | None:
+        self._left_canvas.yview_scroll(1, "units")
+        return "break"
 
     # ----- load / labels -----
 
