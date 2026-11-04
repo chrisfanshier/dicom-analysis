@@ -7,11 +7,18 @@ import tkinter as tk
 from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
 
+import numpy as np
 from PIL import Image, ImageTk
 
-from dicom_multi_view.render import BASE_MAX_HEIGHT_PX, compose_section_rgb, title_strip
+from dicom_multi_view.render import (
+    BASE_MAX_HEIGHT_PX,
+    compose_section_rgb,
+    shared_mm_per_px,
+    title_strip,
+)
 from dicom_multi_view.section import (
     LoadedSection,
+    auto_window_hu,
     load_section,
     set_plane,
     suggest_labels,
@@ -128,8 +135,13 @@ class MultiViewGui(tk.Tk):
         self._max_zoom = 8.0
         self._rebuild_job: str | None = None
         self._plane_job: str | None = None
+        self._win_job: str | None = None
         self._ignore_plane = False
         self._ignore_top = False
+        self._ignore_window = False
+        self._hist_range = (0.0, 1.0)
+        self._hist_counts: np.ndarray | None = None
+        self._hist_drag_which: str | None = None
 
         self.status = tk.StringVar(
             value="Add folder… · shared wheel-zoom / drag-pan · scale in cm"
@@ -145,6 +157,11 @@ class MultiViewGui(tk.Tk):
         self.zoom_label = tk.StringVar(value="Zoom: 100% (shared)")
         self.top_depth_var = tk.StringVar(value="0")
         self.top_manual_var = tk.BooleanVar(value=False)
+        # Greyscale window: "section" = selected only; "all" = shared HU window
+        self.window_scope = tk.StringVar(value="section")
+        self.win_lo = tk.DoubleVar(value=0.0)
+        self.win_hi = tk.DoubleVar(value=1.0)
+        self.win_label = tk.StringVar(value="Window: —")
 
         self._build()
         if initial_paths:
@@ -260,8 +277,51 @@ class MultiViewGui(tk.Tk):
             anchor="w", pady=(4, 0)
         )
 
+        win_fr = ttk.LabelFrame(left, text="Greyscale window (HU)", padding=6)
+        win_fr.grid(row=7, column=0, sticky="ew", pady=(0, 6))
+        scope = ttk.Frame(win_fr)
+        scope.pack(fill=tk.X)
+        ttk.Radiobutton(
+            scope,
+            text="This section",
+            variable=self.window_scope,
+            value="section",
+            command=self._on_window_scope,
+        ).pack(side=tk.LEFT)
+        ttk.Radiobutton(
+            scope,
+            text="All sections",
+            variable=self.window_scope,
+            value="all",
+            command=self._on_window_scope,
+        ).pack(side=tk.LEFT, padx=(8, 0))
+        self.hist_canvas = tk.Canvas(
+            win_fr, height=72, background="#1a1a1a", highlightthickness=0
+        )
+        self.hist_canvas.pack(fill=tk.X, pady=(4, 0))
+        self.hist_canvas.bind("<Configure>", lambda _e: self._draw_histogram())
+        self.hist_canvas.bind("<Button-1>", self._hist_click)
+        self.hist_canvas.bind("<B1-Motion>", self._hist_drag)
+        self.hist_canvas.bind(
+            "<ButtonRelease-1>", lambda _e: setattr(self, "_hist_drag_which", None)
+        )
+        ttk.Label(win_fr, text="Black").pack(anchor="w", pady=(4, 0))
+        self.win_lo_scale = ttk.Scale(
+            win_fr, from_=0, to=1, variable=self.win_lo, command=self._on_window_slide
+        )
+        self.win_lo_scale.pack(fill=tk.X)
+        ttk.Label(win_fr, text="White").pack(anchor="w", pady=(2, 0))
+        self.win_hi_scale = ttk.Scale(
+            win_fr, from_=0, to=1, variable=self.win_hi, command=self._on_window_slide
+        )
+        self.win_hi_scale.pack(fill=tk.X)
+        wb = ttk.Frame(win_fr)
+        wb.pack(fill=tk.X, pady=(4, 0))
+        ttk.Button(wb, text="Auto 1–99%", command=self._auto_window).pack(side=tk.LEFT)
+        ttk.Label(win_fr, textvariable=self.win_label, wraplength=320).pack(anchor="w")
+
         view_fr = ttk.LabelFrame(left, text="View (shared)", padding=6)
-        view_fr.grid(row=7, column=0, sticky="ew", pady=(0, 6))
+        view_fr.grid(row=8, column=0, sticky="ew", pady=(0, 6))
         ttk.Label(view_fr, textvariable=self.zoom_label).pack(anchor="w")
         vr = ttk.Frame(view_fr)
         vr.pack(fill=tk.X, pady=4)
@@ -273,12 +333,12 @@ class MultiViewGui(tk.Tk):
         ttk.Button(vr, text="Zoom −", command=lambda: self._zoom_by(1 / 1.25)).pack(side=tk.LEFT)
         ttk.Label(
             view_fr,
-            text="Wheel zooms toward cursor · drag pans · all sections share one view",
+            text="Wheel zooms toward cursor · drag pans · shared physical cm scale + zoom",
             wraplength=320,
         ).pack(anchor="w", pady=(4, 0))
 
         ttk.Label(left, textvariable=self.status, wraplength=320).grid(
-            row=8, column=0, sticky="ew"
+            row=9, column=0, sticky="ew"
         )
 
         right = ttk.Frame(root, padding=(4, 8, 8, 4))
@@ -480,6 +540,7 @@ class MultiViewGui(tk.Tk):
         i = self._selected_index()
         if i is None or not (0 <= i < len(self.sections)):
             self.plane_label.set("Cut / frame: —")
+            self.win_label.set("Window: —")
             return
         sec = self.sections[i]
         self._ignore_top = True
@@ -503,6 +564,7 @@ class MultiViewGui(tk.Tk):
             f"({sec.plane_count} planes)"
         )
         self.plane_help.set(sec.slider_help)
+        self._sync_window_controls()
 
     def _on_plane_slide(self, _val=None) -> None:
         if self._ignore_plane:
@@ -535,6 +597,190 @@ class MultiViewGui(tk.Tk):
         self.plane_scale.set(mid)
         self._ignore_plane = False
         self._apply_plane()
+
+    # ----- greyscale window / histogram -----
+
+    def _hu_values_for_hist(self) -> np.ndarray:
+        if self.window_scope.get() == "all" and self.sections:
+            chunks = [s.image_hu.ravel() for s in self.sections]
+            return np.concatenate(chunks)
+        i = self._selected_index()
+        if i is None or not self.sections:
+            return np.asarray([], dtype=np.float32)
+        return self.sections[i].image_hu.ravel()
+
+    def _current_window_targets(self) -> list[LoadedSection]:
+        if self.window_scope.get() == "all":
+            return list(self.sections)
+        i = self._selected_index()
+        if i is None:
+            return []
+        return [self.sections[i]]
+
+    def _sync_window_controls(self) -> None:
+        targets = self._current_window_targets()
+        vals = self._hu_values_for_hist()
+        if not targets:
+            self.win_label.set("Window: —")
+            self._hist_counts = None
+            self._draw_histogram()
+            return
+        if self.window_scope.get() == "all":
+            los = {round(float(s.win_lo), 3) for s in targets if s.win_lo is not None}
+            his = {round(float(s.win_hi), 3) for s in targets if s.win_hi is not None}
+            if len(los) == 1 and len(his) == 1:
+                lo, hi = float(targets[0].win_lo), float(targets[0].win_hi)
+            else:
+                lo, hi = auto_window_hu(vals) if vals.size else (0.0, 1.0)
+                for s in targets:
+                    s.win_lo, s.win_hi = lo, hi
+        else:
+            sec = targets[0]
+            if sec.win_lo is None or sec.win_hi is None:
+                sec.win_lo, sec.win_hi = auto_window_hu(sec.image_hu)
+            lo, hi = float(sec.win_lo), float(sec.win_hi)
+
+        if vals.size == 0:
+            vmin, vmax = lo, hi
+        else:
+            vmin = float(np.percentile(vals, 0.5))
+            vmax = float(np.percentile(vals, 99.5))
+            pad = 0.05 * max(vmax - vmin, 1.0)
+            vmin, vmax = vmin - pad, vmax + pad
+        if vmax <= vmin:
+            vmax = vmin + 1.0
+        self._hist_range = (vmin, vmax)
+        self._ignore_window = True
+        self.win_lo_scale.configure(from_=vmin, to=vmax)
+        self.win_hi_scale.configure(from_=vmin, to=vmax)
+        self.win_lo.set(lo)
+        self.win_hi.set(hi)
+        self._ignore_window = False
+        self.win_label.set(f"Window: [{lo:.1f}, {hi:.1f}] HU")
+        if vals.size:
+            counts, _edges = np.histogram(vals, bins=128, range=(vmin, vmax))
+            self._hist_counts = counts.astype(np.float64)
+        else:
+            self._hist_counts = None
+        self._draw_histogram()
+
+    def _on_window_scope(self) -> None:
+        if self.window_scope.get() == "all" and self.sections:
+            # Push selected window to all when switching into shared mode.
+            i = self._selected_index()
+            if i is not None:
+                lo = self.sections[i].win_lo
+                hi = self.sections[i].win_hi
+                if lo is not None and hi is not None:
+                    for s in self.sections:
+                        s.win_lo, s.win_hi = float(lo), float(hi)
+        self._sync_window_controls()
+        self.rebuild()
+
+    def _auto_window(self) -> None:
+        targets = self._current_window_targets()
+        if not targets:
+            return
+        if self.window_scope.get() == "all":
+            vals = self._hu_values_for_hist()
+            lo, hi = auto_window_hu(vals) if vals.size else (0.0, 1.0)
+            for s in targets:
+                s.win_lo, s.win_hi = lo, hi
+        else:
+            sec = targets[0]
+            sec.win_lo, sec.win_hi = auto_window_hu(sec.image_hu)
+        self._sync_window_controls()
+        self.rebuild()
+
+    def _on_window_slide(self, _value=None) -> None:
+        if self._ignore_window:
+            return
+        if self._win_job is not None:
+            self.after_cancel(self._win_job)
+        self._win_job = self.after(40, self._apply_window)
+
+    def _apply_window(self) -> None:
+        self._win_job = None
+        targets = self._current_window_targets()
+        if not targets:
+            return
+        lo = float(self.win_lo.get())
+        hi = float(self.win_hi.get())
+        if hi < lo:
+            lo, hi = hi, lo
+            self._ignore_window = True
+            self.win_lo.set(lo)
+            self.win_hi.set(hi)
+            self._ignore_window = False
+        for s in targets:
+            s.win_lo, s.win_hi = lo, hi
+        self.win_label.set(f"Window: [{lo:.1f}, {hi:.1f}] HU")
+        self._draw_histogram()
+        self.rebuild()
+
+    def _hu_to_x(self, hu: float, width: int) -> float:
+        vmin, vmax = self._hist_range
+        if vmax <= vmin:
+            return 0.0
+        return (hu - vmin) / (vmax - vmin) * max(width - 1, 1)
+
+    def _x_to_hu(self, x: float, width: int) -> float:
+        vmin, vmax = self._hist_range
+        t = float(np.clip(x / max(width - 1, 1), 0.0, 1.0))
+        return float(vmin + t * (vmax - vmin))
+
+    def _draw_histogram(self) -> None:
+        c = self.hist_canvas
+        c.delete("all")
+        w = max(c.winfo_width(), 2)
+        h = max(c.winfo_height(), 2)
+        if self._hist_counts is None or self._hist_counts.size == 0:
+            c.create_text(w // 2, h // 2, text="Load a section", fill="#888")
+            return
+        counts = self._hist_counts
+        peak = float(counts.max()) if counts.max() > 0 else 1.0
+        n = len(counts)
+        bar_w = w / n
+        for i, v in enumerate(counts):
+            bh = (v / peak) * (h - 4)
+            x0 = i * bar_w
+            c.create_rectangle(
+                x0, h - bh, x0 + bar_w + 0.5, h, fill="#6a9fb5", outline="", tags="bar"
+            )
+        lo = float(self.win_lo.get())
+        hi = float(self.win_hi.get())
+        x_lo = self._hu_to_x(lo, w)
+        x_hi = self._hu_to_x(hi, w)
+        c.create_rectangle(x_lo, 0, x_hi, h, fill="#ffffff", stipple="gray50", outline="")
+        c.create_line(x_lo, 0, x_lo, h, fill="#ff6666", width=2, tags="lo")
+        c.create_line(x_hi, 0, x_hi, h, fill="#66ff99", width=2, tags="hi")
+        c.create_text(6, 10, anchor=tk.W, fill="#ccc", text=f"{self._hist_range[0]:.0f}")
+        c.create_text(w - 6, 10, anchor=tk.E, fill="#ccc", text=f"{self._hist_range[1]:.0f}")
+
+    def _hist_click(self, event) -> None:
+        if not self.sections:
+            return
+        w = max(self.hist_canvas.winfo_width(), 2)
+        x_lo = self._hu_to_x(float(self.win_lo.get()), w)
+        x_hi = self._hu_to_x(float(self.win_hi.get()), w)
+        if abs(event.x - x_lo) <= abs(event.x - x_hi):
+            self._hist_drag_which = "lo"
+        else:
+            self._hist_drag_which = "hi"
+        self._hist_drag(event)
+
+    def _hist_drag(self, event) -> None:
+        if self._hist_drag_which is None or not self.sections:
+            return
+        w = max(self.hist_canvas.winfo_width(), 2)
+        hu = self._x_to_hu(float(event.x), w)
+        self._ignore_window = True
+        if self._hist_drag_which == "lo":
+            self.win_lo.set(min(hu, float(self.win_hi.get()) - 1.0))
+        else:
+            self.win_hi.set(max(hu, float(self.win_lo.get()) + 1.0))
+        self._ignore_window = False
+        self._apply_window()
 
     # ----- shared zoom / pan -----
 
@@ -645,14 +891,18 @@ class MultiViewGui(tk.Tk):
             )
             return
 
-        # Depth offsets: always from each section's top_depth_cm
-        # (continuous mode keeps those tops synced from lengths unless pinned)
+        # Shared physical scale: same mm/px for every section (then shared zoom).
+        mm_px = shared_mm_per_px(
+            self.sections,
+            max_height_px=BASE_MAX_HEIGHT_PX,
+            max_width_px=900,
+        )
         tiles: list[Image.Image] = []
         for sec in self.sections:
             body = compose_section_rgb(
                 sec,
                 top_depth_cm=sec.top_depth_cm,
-                max_height_px=BASE_MAX_HEIGHT_PX,
+                mm_per_px=mm_px,
             )
             title = (
                 f"{sec.display_label}  ·  top {sec.top_depth_cm:g}–"

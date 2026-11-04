@@ -8,7 +8,7 @@ import numpy as np
 
 from dicom_multi_view.section import LoadedSection, hu_to_u8
 
-# Cap native compose height; GUI zooms this sheet uniformly (bar stays truthful).
+# Cap native compose height for the tallest section; shared mm/px applied to all.
 BASE_MAX_HEIGHT_PX = 2400
 
 
@@ -22,37 +22,31 @@ def _font(size: int = 12) -> ImageFont.ImageFont:
             return ImageFont.load_default()
 
 
-def _nice_step_cm(extent_cm: float, target_ticks: int = 6) -> float:
-    """Nice tick step in cm."""
-    if extent_cm <= 0:
+def shared_mm_per_px(
+    sections: list[LoadedSection],
+    *,
+    max_height_px: int = BASE_MAX_HEIGHT_PX,
+    max_width_px: int | None = 900,
+) -> float:
+    """
+    One physical display scale for every section (mm per on-screen pixel).
+
+    Chooses the coarsest scale that fits the tallest section in ``max_height_px``
+    and (optionally) the widest section in ``max_width_px``, so shorter sections
+    are shorter — not fatter — and diameters stay comparable.
+    """
+    if not sections:
         return 1.0
-    raw = extent_cm / max(target_ticks, 1)
-    exp = int(np.floor(np.log10(max(raw, 1e-6))))
-    base = 10.0**exp
-    for m in (1.0, 2.0, 5.0, 10.0):
-        if m * base >= raw * 0.8:
-            return m * base
-    return 10.0 * base
-
-
-def _isotropic_size_px(
-    height_px: int,
-    width_px: int,
-    depth_mm_per_px: float,
-    across_mm_per_px: float,
-) -> tuple[int, int, float]:
-    """
-    Size for on-screen isotropic mm (1 display px = target_mm).
-
-    Uses the finer of row/col spacing so detail is preserved; the coarser
-    axis is stretched. Returns (out_h, out_w, target_mm).
-    """
-    d_mm = max(float(depth_mm_per_px), 1e-12)
-    a_mm = max(float(across_mm_per_px), 1e-12)
-    target_mm = min(d_mm, a_mm)
-    out_h = max(1, int(round(height_px * d_mm / target_mm)))
-    out_w = max(1, int(round(width_px * a_mm / target_mm)))
-    return out_h, out_w, target_mm
+    heights = []
+    widths = []
+    for sec in sections:
+        h_mm, w_mm = sec.physical_size_mm()
+        heights.append(max(h_mm, 1e-6))
+        widths.append(max(w_mm, 1e-6))
+    mm = max(heights) / max(int(max_height_px), 1)
+    if max_width_px is not None:
+        mm = max(mm, max(widths) / max(int(max_width_px), 1))
+    return float(max(mm, 1e-9))
 
 
 def _draw_scale_bar_cm(
@@ -60,11 +54,13 @@ def _draw_scale_bar_cm(
     depth_mm_per_px: float,
     *,
     top_depth_cm: float = 0.0,
-    bar_width_px: int = 64,
+    bar_width_px: int = 72,
 ) -> Image.Image:
     """
     Depth scale bar in cm. ``depth_mm_per_px`` is physical mm per image row
     at this compose resolution; zoom must scale section+bar together.
+
+    Minor ticks every 1 cm; labeled major ticks every 10 cm.
     """
     bar = Image.new("RGB", (bar_width_px, height_px), (32, 32, 36))
     draw = ImageDraw.Draw(bar)
@@ -73,22 +69,42 @@ def _draw_scale_bar_cm(
 
     depth_cm_per_px = depth_mm_per_px / 10.0
     extent_cm = height_px * depth_cm_per_px
-    step = _nice_step_cm(extent_cm)
+    # Fixed physical ticks: 1 cm minor, label every 10 cm major.
+    minor_cm = 1.0
+    major_cm = 10.0
 
     x_rule = 12
     draw.line([(x_rule, 0), (x_rule, height_px - 1)], fill=(220, 220, 220), width=2)
 
-    first = np.ceil(top_depth_cm / step) * step
+    first = np.ceil(top_depth_cm / minor_cm) * minor_cm
     d = float(first)
     end = top_depth_cm + extent_cm + 1e-9
     while d <= end:
         y = (d - top_depth_cm) / max(depth_cm_per_px, 1e-12)
         if 0 <= y < height_px:
             yi = int(round(y))
-            draw.line([(x_rule - 2, yi), (x_rule + 10, yi)], fill=(230, 230, 230), width=1)
-            label = f"{d:.0f}" if abs(d - round(d)) < 1e-6 else f"{d:.1f}"
-            draw.text((x_rule + 12, max(0, yi - 6)), label, fill=(210, 210, 215), font=font_sm)
-        d += step
+            # Treat near-integers as majors when within 0.01 cm of a 10 cm mark.
+            is_major = abs(d / major_cm - round(d / major_cm)) < 1e-6
+            if is_major:
+                draw.line(
+                    [(x_rule - 3, yi), (x_rule + 14, yi)],
+                    fill=(230, 230, 230),
+                    width=2,
+                )
+                label = f"{d:.0f}" if abs(d - round(d)) < 1e-6 else f"{d:.1f}"
+                draw.text(
+                    (x_rule + 16, max(0, yi - 6)),
+                    label,
+                    fill=(210, 210, 215),
+                    font=font_sm,
+                )
+            else:
+                draw.line(
+                    [(x_rule - 1, yi), (x_rule + 7, yi)],
+                    fill=(160, 160, 165),
+                    width=1,
+                )
+        d += minor_cm
 
     draw.text((4, 2), "cm", fill=(170, 170, 180), font=font)
     draw.text((4, height_px - 14), "depth", fill=(120, 120, 130), font=font_sm)
@@ -99,49 +115,62 @@ def compose_section_rgb(
     section: LoadedSection,
     *,
     top_depth_cm: float | None = None,
-    bar_width_px: int = 64,
+    bar_width_px: int = 72,
     win_lo: float | None = None,
     win_hi: float | None = None,
+    mm_per_px: float | None = None,
     max_height_px: int | None = BASE_MAX_HEIGHT_PX,
 ) -> Image.Image:
     """
     Greyscale section + cm depth scale bar on the right.
 
-    Resamples so on-screen aspect matches physical mm (depth vs across
-    spacing), then optionally caps height with a uniform scale so the bar
-    stays consistent with the image.
+    Prefer ``mm_per_px`` (shared across the layout). If omitted, falls back to
+    per-section isotropic sizing capped by ``max_height_px`` (legacy).
     """
     if top_depth_cm is None:
         top_depth_cm = section.top_depth_cm
+    if win_lo is None:
+        win_lo = section.win_lo
+    if win_hi is None:
+        win_hi = section.win_hi
 
     u8 = hu_to_u8(section.image_hu, win_lo, win_hi)
     h0, w0 = u8.shape
-    iso_h, iso_w, target_mm = _isotropic_size_px(
-        h0, w0, section.depth_mm_per_px, section.across_mm_per_px
-    )
+    h_mm = h0 * float(section.depth_mm_per_px)
+    w_mm = w0 * float(section.across_mm_per_px)
+
+    if mm_per_px is None or mm_per_px <= 0:
+        # Legacy single-section path: isotropic, then optional height cap.
+        target_mm = min(
+            max(float(section.depth_mm_per_px), 1e-12),
+            max(float(section.across_mm_per_px), 1e-12),
+        )
+        iso_h = max(1, int(round(h_mm / target_mm)))
+        iso_w = max(1, int(round(w_mm / target_mm)))
+        if max_height_px and iso_h > max_height_px:
+            scale = max_height_px / iso_h
+            iso_h = max_height_px
+            iso_w = max(1, int(round(iso_w * scale)))
+            target_mm = target_mm / scale
+        mm_per_px = target_mm
+        out_h, out_w = iso_h, iso_w
+    else:
+        out_h = max(1, int(round(h_mm / mm_per_px)))
+        out_w = max(1, int(round(w_mm / mm_per_px)))
+
     img = Image.fromarray(np.stack([u8, u8, u8], axis=-1), mode="RGB")
-    if iso_h != h0 or iso_w != w0:
-        img = img.resize((iso_w, iso_h), Image.Resampling.BILINEAR)
-
-    h, w = iso_h, iso_w
-    depth_mm_per_px = target_mm
-
-    if max_height_px and h > max_height_px:
-        scale = max_height_px / h
-        new_w = max(1, int(round(w * scale)))
-        img = img.resize((new_w, max_height_px), Image.Resampling.BILINEAR)
-        depth_mm_per_px = target_mm / scale
-        h, w = max_height_px, new_w
+    if out_h != h0 or out_w != w0:
+        img = img.resize((out_w, out_h), Image.Resampling.BILINEAR)
 
     bar = _draw_scale_bar_cm(
-        h,
-        depth_mm_per_px,
+        out_h,
+        float(mm_per_px),
         top_depth_cm=top_depth_cm,
         bar_width_px=bar_width_px,
     )
-    out = Image.new("RGB", (w + bar_width_px, h), (20, 20, 22))
+    out = Image.new("RGB", (out_w + bar_width_px, out_h), (20, 20, 22))
     out.paste(img, (0, 0))
-    out.paste(bar, (w, 0))
+    out.paste(bar, (out_w, 0))
     return out
 
 
