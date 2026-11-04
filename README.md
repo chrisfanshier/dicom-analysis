@@ -1,10 +1,9 @@
-# core-stitch
+# dicom_stitch
 
-Geometry-first stitch GUI for Toshiba Aquilion **Coron TOP / Coron BTM** MPR DICOM folders.
+Tools for sediment-core CT DICOM:
 
-Does **not** trust DICOM patient/FoR coordinates for coarse alignment. Masks core+liner vs air, aligns by geometry, then 1-DoF overlap along the core axis with Flip / Roll controls.
-
-The separate `dicom_stuff` JPEG viewer is unrelated — keep using that for single-series mid-slice JPEGs.
+1. **dicom-multi-view** (preferred on branch `dicom-multi-view`) — load multiple series folders as core-section views with cm depth scale bars.
+2. **core-stitch** — legacy Coron TOP/BTM stitch GUI (overlap join, Analyze ROI, Otsu, export). Not wired into multi-view.
 
 ## Install
 
@@ -15,23 +14,35 @@ python -m venv .venv
 pip install -e .
 ```
 
-## Run
+## Run multi-view (MVP)
+
+```bash
+dicom-multi-view
+dicom-multi-view "D:\path\SE1" "D:\path\SE2"
+python -m dicom_multi_view
+```
+
+### What it does
+
+- **Add folder…** — browse for a DICOM series directory. On each add, enter **core name**, **section**, and optional **top depth (cm)** (blank/0 = start at 0; a number pins a manual top).
+- Auto-detect **compressed/uncompressed** (Transfer Syntax) and **coronal MPR** vs **axial → coronal** reformat.
+- **Cut / frame slider** (selected section):
+  - Coronal MPR: browses parallel stack frames through the core diameter.
+  - Axial brick: coronal reformat; slider moves the cut through the diameter (Y); image rows are down-core Z.
+- **Depth (cm):** continuous mode sets tops from the sum of image lengths in list order (pinned manual tops kept); per-section mode uses each section’s own top (often 0). Edit top / pin on the left rail.
+- **Layout:** side-by-side or stacked. **Reorder** with ↑/↓.
+- **View:** shared wheel-zoom (toward cursor), drag-pan, Fit width / Reset. Scale bar zooms with the image so cm ticks stay physically true.
+- Compressed series decode on read via pydicom/pylibjpeg (can be slow). Bulk decompress: `scripts/decompress_dicom_tree.py`.
+
+### Out of scope (v1)
+
+TOP/BTM stitching, sediment ROI Analyze, Otsu filters, downcore HU profiling, PNG/PDF export.
+
+## Run stitch (legacy)
 
 ```bash
 core-stitch
 core-stitch "D:\path\SE1" "D:\path\SE2"
 ```
-
-## Flow
-
-Left rail tabs **Align** / **Display** / **Analyze** / **Export**; image fills the right pane.
-
-1. **Align** — open TOP/BTM, coarse align, Flip/Roll/nudge, Refine join  
-2. **Display** — alignment colors, slice browser, crop, zoom, overlap fuse, HU histogram window  
-3. **Analyze** (optional) — auto sediment ROI, void/clast HU filter (Otsu), downcore mean HU plot, optional 3D mask  
-4. **Export** — stitch products and/or sediment mask / ROI image (Analyze not required for stitch export)  
-
-
-**B nudge:** X/Y move BTM; **Widen** only expands slider travel. Pan: middle-drag or Alt+drag. Arrows = 1 mm (Shift=5). Slice: `[` `]` or PageUp/Down.
 
 See [docs/stitch-gui-memo.md](docs/stitch-gui-memo.md).

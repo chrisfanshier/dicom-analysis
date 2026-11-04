@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "core-stitch"
 version = "0.1.0"
-description = "Geometry-first stitch for Aquilion Coron TOP/BTM MPR halves"
+description = "DICOM tools for sediment cores: multi-view sections + Coron TOP/BTM stitch"
 readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
@@ -21,6 +21,7 @@ dependencies = [
 ]
 
 [project.scripts]
+dicom-multi-view = "dicom_multi_view.gui:main"
 core-stitch = "core_stitch.gui:main"
 core-stitch-cli = "core_stitch.cli:main"
 
