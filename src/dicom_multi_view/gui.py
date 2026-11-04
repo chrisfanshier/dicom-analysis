@@ -11,6 +11,12 @@ from tkinter import filedialog, messagebox, ttk
 import numpy as np
 from PIL import Image, ImageTk
 
+from dicom_multi_view.mscl import (
+    MsclDataset,
+    MsclPlotSpec,
+    parse_mscl_out,
+    render_mscl_strips_for_section,
+)
 from dicom_multi_view.render import (
     BASE_MAX_HEIGHT_PX,
     ComposeLayout,
@@ -195,6 +201,20 @@ class MultiViewGui(tk.Tk):
         self.win_hi = tk.DoubleVar(value=1.0)
         self.win_label = tk.StringVar(value="Window: —")
 
+        # MSCL (multi-sensor core logger) overlay — shared depth cm with sections
+        self.mscl: MsclDataset | None = None
+        self.mscl_specs: list[MsclPlotSpec] = []
+        self.mscl_show = tk.BooleanVar(value=True)
+        self.mscl_file_label = tk.StringVar(value="No MSCL file loaded")
+        self.mscl_info = tk.StringVar(value="")
+        self.mscl_core_var = tk.StringVar(value="")
+        self.mscl_width_var = tk.StringVar(value="72")
+        self.mscl_xmin_var = tk.StringVar(value="")  # blank = auto
+        self.mscl_xmax_var = tk.StringVar(value="")
+        self.mscl_override_xmin = tk.StringVar(value="")
+        self.mscl_override_xmax = tk.StringVar(value="")
+        self._mscl_channel_vars: dict[str, tk.BooleanVar] = {}
+
         self._build()
         if initial_paths:
             self.after(150, lambda: self._load_paths(initial_paths, prompt=True))
@@ -263,11 +283,21 @@ class MultiViewGui(tk.Tk):
             text="Sediment core sections — view only (no stitch / export)",
             wraplength=380,
         )
-        subtitle.grid(row=1, column=0, sticky="ew", pady=(0, 8))
+        subtitle.grid(row=1, column=0, sticky="ew", pady=(0, 6))
         self._wrap_labels.append(subtitle)
 
-        actions = ttk.Frame(left)
-        actions.grid(row=2, column=0, sticky="ew", pady=(0, 6))
+        notebook = ttk.Notebook(left)
+        notebook.grid(row=2, column=0, sticky="nsew", pady=(0, 6))
+        left.rowconfigure(2, weight=1)
+        ct_tab = ttk.Frame(notebook, padding=(4, 6, 4, 4))
+        mscl_tab = ttk.Frame(notebook, padding=(4, 6, 4, 4))
+        notebook.add(ct_tab, text="CT sections")
+        notebook.add(mscl_tab, text="MSCL")
+        ct_tab.columnconfigure(0, weight=1)
+        mscl_tab.columnconfigure(0, weight=1)
+
+        actions = ttk.Frame(ct_tab)
+        actions.grid(row=0, column=0, sticky="ew", pady=(0, 6))
         ttk.Button(actions, text="Add folder…", command=self.add_folder).pack(
             side=tk.LEFT, padx=(0, 4)
         )
@@ -285,9 +315,9 @@ class MultiViewGui(tk.Tk):
         )
 
         list_fr = ttk.LabelFrame(
-            left, text="Sections (select one — required for High quality)", padding=4
+            ct_tab, text="Sections (select one — required for High quality)", padding=4
         )
-        list_fr.grid(row=3, column=0, sticky="ew", pady=(0, 6))
+        list_fr.grid(row=1, column=0, sticky="ew", pady=(0, 6))
         list_fr.columnconfigure(0, weight=1)
         self.listbox = tk.Listbox(
             list_fr,
@@ -311,8 +341,8 @@ class MultiViewGui(tk.Tk):
         list_hint.grid(row=1, column=0, columnspan=2, sticky="w", pady=(4, 0))
         self._wrap_labels.append(list_hint)
 
-        depth_fr = ttk.LabelFrame(left, text="Depth scale (cm)", padding=6)
-        depth_fr.grid(row=4, column=0, sticky="ew", pady=(0, 6))
+        depth_fr = ttk.LabelFrame(ct_tab, text="Depth scale (cm)", padding=6)
+        depth_fr.grid(row=2, column=0, sticky="ew", pady=(0, 6))
         ttk.Radiobutton(
             depth_fr,
             text="Continuous — tops = sum of core lengths in list order",
@@ -378,8 +408,8 @@ class MultiViewGui(tk.Tk):
             depth_fr, text="Reset insets to image ends", command=self._reset_core_insets
         ).pack(anchor="w", pady=(2, 0))
 
-        layout_fr = ttk.LabelFrame(left, text="Layout", padding=6)
-        layout_fr.grid(row=5, column=0, sticky="ew", pady=(0, 6))
+        layout_fr = ttk.LabelFrame(ct_tab, text="Layout", padding=6)
+        layout_fr.grid(row=3, column=0, sticky="ew", pady=(0, 6))
         ttk.Radiobutton(
             layout_fr, text="Side by side", variable=self.layout_mode, value="side", command=self.rebuild
         ).pack(anchor="w")
@@ -391,8 +421,8 @@ class MultiViewGui(tk.Tk):
             command=self.rebuild,
         ).pack(anchor="w")
 
-        plane_fr = ttk.LabelFrame(left, text="Cut / frame (selected)", padding=6)
-        plane_fr.grid(row=6, column=0, sticky="ew", pady=(0, 6))
+        plane_fr = ttk.LabelFrame(ct_tab, text="Cut / frame (selected)", padding=6)
+        plane_fr.grid(row=4, column=0, sticky="ew", pady=(0, 6))
         plane_lbl = ttk.Label(plane_fr, textvariable=self.plane_label, wraplength=380)
         plane_lbl.pack(anchor="w")
         self._wrap_labels.append(plane_lbl)
@@ -407,8 +437,8 @@ class MultiViewGui(tk.Tk):
         plane_help_lbl.pack(anchor="w", pady=(4, 0))
         self._wrap_labels.append(plane_help_lbl)
 
-        win_fr = ttk.LabelFrame(left, text="Greyscale window (HU)", padding=6)
-        win_fr.grid(row=7, column=0, sticky="ew", pady=(0, 6))
+        win_fr = ttk.LabelFrame(ct_tab, text="Greyscale window (HU)", padding=6)
+        win_fr.grid(row=5, column=0, sticky="ew", pady=(0, 6))
         scope = ttk.Frame(win_fr)
         scope.pack(fill=tk.X)
         ttk.Radiobutton(
@@ -452,8 +482,8 @@ class MultiViewGui(tk.Tk):
         win_lbl.pack(anchor="w")
         self._wrap_labels.append(win_lbl)
 
-        view_fr = ttk.LabelFrame(left, text="View (shared)", padding=6)
-        view_fr.grid(row=8, column=0, sticky="ew", pady=(0, 6))
+        view_fr = ttk.LabelFrame(ct_tab, text="View (shared)", padding=6)
+        view_fr.grid(row=6, column=0, sticky="ew", pady=(0, 6))
         ttk.Label(view_fr, textvariable=self.zoom_label).pack(anchor="w")
         vr = ttk.Frame(view_fr)
         vr.pack(fill=tk.X, pady=4)
@@ -481,8 +511,10 @@ class MultiViewGui(tk.Tk):
         view_help.pack(anchor="w", pady=(4, 0))
         self._wrap_labels.append(view_help)
 
+        self._build_mscl_tab(mscl_tab)
+
         status_lbl = ttk.Label(left, textvariable=self.status, wraplength=380)
-        status_lbl.grid(row=9, column=0, sticky="ew")
+        status_lbl.grid(row=3, column=0, sticky="ew")
         self._wrap_labels.append(status_lbl)
 
         right = ttk.Frame(self.paned, padding=(4, 8, 8, 4))
@@ -538,6 +570,346 @@ class MultiViewGui(tk.Tk):
     def _on_left_button5(self, _event: tk.Event) -> str | None:
         self._left_canvas.yview_scroll(1, "units")
         return "break"
+
+    # ----- MSCL tab -----
+
+    def _build_mscl_tab(self, tab: ttk.Frame) -> None:
+        help_lbl = ttk.Label(
+            tab,
+            text=(
+                "Load a Geotek MSCL .out file. SB Depth is converted to cm "
+                "(m->cm for older files) and aligned with the CT depth scale. "
+                "Calibration rows (SECT NUM containing 'cal') are skipped."
+            ),
+            wraplength=380,
+        )
+        help_lbl.grid(row=0, column=0, sticky="ew", pady=(0, 6))
+        self._wrap_labels.append(help_lbl)
+
+        btns = ttk.Frame(tab)
+        btns.grid(row=1, column=0, sticky="ew", pady=(0, 4))
+        ttk.Button(btns, text="Load .out…", command=self._mscl_load).pack(
+            side=tk.LEFT, padx=(0, 4)
+        )
+        ttk.Button(btns, text="Clear", command=self._mscl_clear).pack(side=tk.LEFT)
+
+        file_lbl = ttk.Label(tab, textvariable=self.mscl_file_label, wraplength=380)
+        file_lbl.grid(row=2, column=0, sticky="ew")
+        self._wrap_labels.append(file_lbl)
+        info_lbl = ttk.Label(tab, textvariable=self.mscl_info, wraplength=380)
+        info_lbl.grid(row=3, column=0, sticky="ew", pady=(2, 6))
+        self._wrap_labels.append(info_lbl)
+
+        core_row = ttk.Frame(tab)
+        core_row.grid(row=4, column=0, sticky="ew", pady=(0, 6))
+        ttk.Label(core_row, text="Core label (optional)").pack(side=tk.LEFT)
+        ttk.Entry(core_row, textvariable=self.mscl_core_var, width=24).pack(
+            side=tk.LEFT, padx=6
+        )
+
+        ttk.Checkbutton(
+            tab,
+            text="Show MSCL strips beside sections",
+            variable=self.mscl_show,
+            command=self._mscl_apply_and_rebuild,
+        ).grid(row=5, column=0, sticky="w", pady=(0, 6))
+
+        series_fr = ttk.LabelFrame(tab, text="Series to plot", padding=6)
+        series_fr.grid(row=6, column=0, sticky="ew", pady=(0, 6))
+        series_fr.columnconfigure(0, weight=1)
+        self.mscl_series_frame = ttk.Frame(series_fr)
+        self.mscl_series_frame.grid(row=0, column=0, sticky="ew")
+        series_btns = ttk.Frame(series_fr)
+        series_btns.grid(row=1, column=0, sticky="w", pady=(4, 0))
+        ttk.Button(series_btns, text="All", command=lambda: self._mscl_set_all(True)).pack(
+            side=tk.LEFT, padx=(0, 4)
+        )
+        ttk.Button(series_btns, text="None", command=lambda: self._mscl_set_all(False)).pack(
+            side=tk.LEFT
+        )
+
+        width_fr = ttk.LabelFrame(tab, text="Plot width (px per series)", padding=6)
+        width_fr.grid(row=7, column=0, sticky="ew", pady=(0, 6))
+        wr = ttk.Frame(width_fr)
+        wr.pack(fill=tk.X)
+        ttk.Label(wr, text="Width").pack(side=tk.LEFT)
+        we = ttk.Entry(wr, textvariable=self.mscl_width_var, width=8)
+        we.pack(side=tk.LEFT, padx=6)
+        we.bind("<Return>", lambda _e: self._mscl_apply_and_rebuild())
+        ttk.Button(wr, text="Apply", command=self._mscl_apply_and_rebuild).pack(side=tk.LEFT)
+
+        xlim_fr = ttk.LabelFrame(tab, text="X-axis limits", padding=6)
+        xlim_fr.grid(row=8, column=0, sticky="ew", pady=(0, 6))
+        glob = ttk.Frame(xlim_fr)
+        glob.pack(fill=tk.X)
+        ttk.Label(glob, text="Global min").pack(side=tk.LEFT)
+        ttk.Entry(glob, textvariable=self.mscl_xmin_var, width=8).pack(side=tk.LEFT, padx=4)
+        ttk.Label(glob, text="max").pack(side=tk.LEFT)
+        ttk.Entry(glob, textvariable=self.mscl_xmax_var, width=8).pack(side=tk.LEFT, padx=4)
+        ttk.Label(
+            xlim_fr,
+            text="Leave blank for auto (2–98% of samples in each section’s depth span).",
+            wraplength=360,
+        ).pack(anchor="w", pady=(4, 0))
+        ttk.Button(
+            xlim_fr, text="Apply global limits to all series", command=self._mscl_apply_global_xlim
+        ).pack(anchor="w", pady=(4, 0))
+
+        ttk.Separator(xlim_fr, orient=tk.HORIZONTAL).pack(fill=tk.X, pady=6)
+        ttk.Label(xlim_fr, text="Per-series override (select below)").pack(anchor="w")
+        self.mscl_override_list = tk.Listbox(
+            xlim_fr,
+            height=5,
+            exportselection=False,
+            activestyle="dotbox",
+            selectbackground="#2a6a9a",
+            selectforeground="#ffffff",
+        )
+        self.mscl_override_list.pack(fill=tk.X, pady=(2, 0))
+        self.mscl_override_list.bind("<<ListboxSelect>>", self._mscl_on_override_select)
+        ov = ttk.Frame(xlim_fr)
+        ov.pack(fill=tk.X, pady=(4, 0))
+        ttk.Label(ov, text="min").pack(side=tk.LEFT)
+        ttk.Entry(ov, textvariable=self.mscl_override_xmin, width=8).pack(side=tk.LEFT, padx=4)
+        ttk.Label(ov, text="max").pack(side=tk.LEFT)
+        ttk.Entry(ov, textvariable=self.mscl_override_xmax, width=8).pack(side=tk.LEFT, padx=4)
+        ovb = ttk.Frame(xlim_fr)
+        ovb.pack(fill=tk.X, pady=(4, 0))
+        ttk.Button(ovb, text="Set override", command=self._mscl_set_override).pack(
+            side=tk.LEFT, padx=(0, 4)
+        )
+        ttk.Button(ovb, text="Clear override", command=self._mscl_clear_override).pack(
+            side=tk.LEFT
+        )
+
+        ttk.Button(tab, text="Update view", command=self._mscl_apply_and_rebuild).grid(
+            row=9, column=0, sticky="w", pady=(4, 0)
+        )
+
+    def _mscl_load(self) -> None:
+        path = filedialog.askopenfilename(
+            title="Select MSCL .out file",
+            filetypes=[
+                ("MSCL / text", "*.out *.txt *.csv"),
+                ("All files", "*.*"),
+            ],
+        )
+        if not path:
+            return
+        try:
+            ds = parse_mscl_out(path)
+        except Exception as exc:
+            messagebox.showerror("MSCL load failed", str(exc), parent=self)
+            return
+        self.mscl = ds
+        if not self.mscl_core_var.get().strip():
+            # Guess core from filename stem
+            stem = Path(path).stem
+            self.mscl_core_var.set(stem.replace("_mstdata", "").replace("-mstdata", ""))
+        self.mscl_file_label.set(str(Path(path)))
+        self.mscl_info.set(
+            f"{ds.header_style} header · {len(ds.depth_cm)} pts · "
+            f"depth {float(ds.depth_cm.min()):.1f}–{float(ds.depth_cm.max()):.1f} cm · "
+            f"cal filtered {ds.n_cal_filtered} · " + "; ".join(ds.notes)
+        )
+        default_on = {"Den1", "MS1", "PWVel", "RES", "Imp", "CT", "ST"}
+        width = self._mscl_parse_width()
+        gmin, gmax = self._mscl_parse_xlim(self.mscl_xmin_var.get(), self.mscl_xmax_var.get())
+        self.mscl_specs = [
+            MsclPlotSpec(
+                name=name,
+                enabled=name in default_on,
+                width_px=width,
+                xmin=gmin,
+                xmax=gmax,
+            )
+            for name in ds.channel_names
+        ]
+        self._mscl_rebuild_channel_checks()
+        self._mscl_rebuild_override_list()
+        self.status.set(f"Loaded MSCL: {Path(path).name}")
+        self.rebuild()
+
+    def _mscl_clear(self) -> None:
+        self.mscl = None
+        self.mscl_specs = []
+        self.mscl_file_label.set("No MSCL file loaded")
+        self.mscl_info.set("")
+        self._mscl_rebuild_channel_checks()
+        self._mscl_rebuild_override_list()
+        self.rebuild()
+
+    def _mscl_rebuild_channel_checks(self) -> None:
+        for child in self.mscl_series_frame.winfo_children():
+            child.destroy()
+        self._mscl_channel_vars.clear()
+        if not self.mscl_specs:
+            ttk.Label(self.mscl_series_frame, text="(load a file to choose series)").pack(
+                anchor="w"
+            )
+            return
+        for spec in self.mscl_specs:
+            var = tk.BooleanVar(value=spec.enabled)
+            self._mscl_channel_vars[spec.name] = var
+            unit = ""
+            if self.mscl is not None:
+                for col in self.mscl.columns:
+                    if col.name == spec.name and col.unit:
+                        unit = f"  [{col.unit}]"
+                        break
+            ttk.Checkbutton(
+                self.mscl_series_frame,
+                text=f"{spec.name}{unit}",
+                variable=var,
+                command=self._mscl_apply_and_rebuild,
+            ).pack(anchor="w")
+
+    def _mscl_rebuild_override_list(self) -> None:
+        self.mscl_override_list.delete(0, tk.END)
+        for spec in self.mscl_specs:
+            lim = "auto"
+            if spec.xmin is not None or spec.xmax is not None:
+                lo = f"{spec.xmin:g}" if spec.xmin is not None else "auto"
+                hi = f"{spec.xmax:g}" if spec.xmax is not None else "auto"
+                lim = f"{lo} … {hi}"
+            flag = "✓" if spec.enabled else "·"
+            self.mscl_override_list.insert(tk.END, f"{flag} {spec.name}  ({lim})")
+
+    def _mscl_set_all(self, enabled: bool) -> None:
+        for var in self._mscl_channel_vars.values():
+            var.set(enabled)
+        self._mscl_apply_and_rebuild()
+
+    def _mscl_parse_width(self) -> int:
+        try:
+            w = int(float(self.mscl_width_var.get().strip() or "72"))
+        except ValueError:
+            w = 72
+        return max(24, min(400, w))
+
+    @staticmethod
+    def _mscl_parse_xlim(
+        xmin_s: str, xmax_s: str
+    ) -> tuple[float | None, float | None]:
+        def one(s: str) -> float | None:
+            s = (s or "").strip()
+            if s == "":
+                return None
+            return float(s)
+
+        try:
+            return one(xmin_s), one(xmax_s)
+        except ValueError:
+            return None, None
+
+    def _mscl_sync_specs_from_ui(self) -> None:
+        width = self._mscl_parse_width()
+        for spec in self.mscl_specs:
+            var = self._mscl_channel_vars.get(spec.name)
+            if var is not None:
+                spec.enabled = bool(var.get())
+            spec.width_px = width
+
+    def _mscl_apply_global_xlim(self) -> None:
+        try:
+            for s in (self.mscl_xmin_var.get(), self.mscl_xmax_var.get()):
+                if s.strip():
+                    float(s.strip())
+            gmin, gmax = self._mscl_parse_xlim(
+                self.mscl_xmin_var.get(), self.mscl_xmax_var.get()
+            )
+        except ValueError:
+            messagebox.showerror("X limits", "Enter numeric min/max, or leave blank.", parent=self)
+            return
+        for spec in self.mscl_specs:
+            spec.xmin = gmin
+            spec.xmax = gmax
+        self._mscl_rebuild_override_list()
+        self._mscl_apply_and_rebuild()
+
+    def _mscl_selected_override_spec(self) -> MsclPlotSpec | None:
+        sel = self.mscl_override_list.curselection()
+        if not sel:
+            return None
+        idx = int(sel[0])
+        if 0 <= idx < len(self.mscl_specs):
+            return self.mscl_specs[idx]
+        return None
+
+    def _mscl_on_override_select(self, _event=None) -> None:
+        spec = self._mscl_selected_override_spec()
+        if spec is None:
+            return
+        self.mscl_override_xmin.set("" if spec.xmin is None else f"{spec.xmin:g}")
+        self.mscl_override_xmax.set("" if spec.xmax is None else f"{spec.xmax:g}")
+
+    def _mscl_set_override(self) -> None:
+        spec = self._mscl_selected_override_spec()
+        if spec is None:
+            messagebox.showinfo("MSCL", "Select a series in the list first.", parent=self)
+            return
+        try:
+            xmin, xmax = self._mscl_parse_xlim(
+                self.mscl_override_xmin.get(), self.mscl_override_xmax.get()
+            )
+            for s in (self.mscl_override_xmin.get(), self.mscl_override_xmax.get()):
+                if s.strip():
+                    float(s.strip())
+        except ValueError:
+            messagebox.showerror("X limits", "Enter numeric min/max, or leave blank.", parent=self)
+            return
+        spec.xmin = xmin
+        spec.xmax = xmax
+        self._mscl_rebuild_override_list()
+        self._mscl_apply_and_rebuild()
+
+    def _mscl_clear_override(self) -> None:
+        spec = self._mscl_selected_override_spec()
+        if spec is None:
+            return
+        spec.xmin = None
+        spec.xmax = None
+        self.mscl_override_xmin.set("")
+        self.mscl_override_xmax.set("")
+        self._mscl_rebuild_override_list()
+        self._mscl_apply_and_rebuild()
+
+    def _mscl_apply_and_rebuild(self) -> None:
+        self._mscl_sync_specs_from_ui()
+        self._mscl_rebuild_override_list()
+        self.rebuild()
+
+    def _attach_mscl_to_body(
+        self,
+        body: Image.Image,
+        body_lay: ComposeLayout,
+        sec: LoadedSection,
+        mm_px: float,
+    ) -> Image.Image:
+        """Paste MSCL strips to the right of a composed section (same image height)."""
+        if self.mscl is None or not self.mscl_show.get() or not self.mscl_specs:
+            return body
+        self._mscl_sync_specs_from_ui()
+        strips = render_mscl_strips_for_section(
+            self.mscl,
+            self.mscl_specs,
+            height_px=body_lay.img_h,
+            top_depth_cm=sec.top_depth_cm,
+            core_top_inset_cm=sec.core_top_inset_cm,
+            depth_extent_cm=sec.depth_extent_cm,
+            mm_per_px=mm_px,
+        )
+        if strips is None:
+            return body
+        gap = 6
+        out = Image.new(
+            "RGB",
+            (body.width + gap + strips.width, body.height),
+            (20, 20, 22),
+        )
+        out.paste(body, (0, 0))
+        out.paste(strips, (body.width + gap, 0))
+        return out
 
     # ----- load / labels -----
 
@@ -1433,13 +1805,20 @@ class MultiViewGui(tk.Tk):
         self._sheet_layouts = []
         self._overview_mm_per_px = 1.0
         if not self.sections:
-            self.canvas.create_text(
-                24,
-                24,
-                anchor="nw",
-                fill="#888",
-                text="No sections loaded.\nClick Add folder… to browse for a DICOM series.",
-            )
+            if self.mscl is not None and self.mscl_show.get() and self.mscl_specs:
+                self._compose_mscl_only()
+            else:
+                self.canvas.create_text(
+                    24,
+                    24,
+                    anchor="nw",
+                    fill="#888",
+                    text=(
+                        "No sections loaded.\n"
+                        "Click Add folder… for a DICOM series, or open the MSCL tab "
+                        "to load a .out file."
+                    ),
+                )
             return
 
         # Shared physical scale: same mm/px for every section (then shared zoom).
@@ -1452,17 +1831,21 @@ class MultiViewGui(tk.Tk):
         tiles: list[Image.Image] = []
         body_layouts: list[ComposeLayout] = []
         title_hs: list[int] = []
+        mscl_core = self.mscl_core_var.get().strip() if self.mscl is not None else ""
         for sec in self.sections:
             body, body_lay = compose_section_rgb(
                 sec,
                 top_depth_cm=sec.top_depth_cm,
                 mm_per_px=mm_px,
             )
+            body = self._attach_mscl_to_body(body, body_lay, sec, mm_px)
             title = (
                 f"{sec.display_label}  ·  core {sec.top_depth_cm:g}–"
                 f"{sec.top_depth_cm + sec.core_length_cm:.1f} cm  ·  "
                 f"{sec.badge_geometry}  ·  {sec.badge_compression}"
             )
+            if mscl_core and self.mscl_show.get():
+                title += f"  ·  MSCL {mscl_core}"
             head = title_strip(title, body.width)
             stacked = Image.new("RGB", (body.width, head.height + body.height), (20, 20, 22))
             stacked.paste(head, (0, 0))
@@ -1520,6 +1903,40 @@ class MultiViewGui(tk.Tk):
                 y += t.height + gap
         self._base_sheet = sheet
         self._sheet_layouts = sheet_layouts
+
+    def _compose_mscl_only(self) -> None:
+        """Render MSCL strips alone when no CT sections are loaded."""
+        assert self.mscl is not None
+        self._mscl_sync_specs_from_ui()
+        d0 = float(np.nanmin(self.mscl.depth_cm))
+        d1 = float(np.nanmax(self.mscl.depth_cm))
+        extent = max(d1 - d0, 1.0)
+        # ~4 px per cm, capped
+        height = max(200, min(BASE_MAX_HEIGHT_PX, int(round(extent * 4.0))))
+        mm_px = (extent * 10.0) / height  # mm per px over full span
+        strips = render_mscl_strips_for_section(
+            self.mscl,
+            self.mscl_specs,
+            height_px=height,
+            top_depth_cm=d0,
+            core_top_inset_cm=0.0,
+            depth_extent_cm=extent,
+            mm_per_px=mm_px,
+        )
+        if strips is None:
+            self.canvas.create_text(
+                24, 24, anchor="nw", fill="#888", text="MSCL loaded but no series selected."
+            )
+            return
+        core = self.mscl_core_var.get().strip() or self.mscl.path.name
+        title = f"MSCL · {core}  ·  {d0:g}–{d1:g} cm"
+        head = title_strip(title, strips.width)
+        sheet = Image.new("RGB", (strips.width, head.height + strips.height), (20, 20, 22))
+        sheet.paste(head, (0, 0))
+        sheet.paste(strips, (0, head.height))
+        self._base_sheet = sheet
+        self._sheet_layouts = []
+        self._overview_mm_per_px = float(mm_px)
 
 
 def main(argv: list[str] | None = None) -> None:
