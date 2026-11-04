@@ -15,6 +15,8 @@ from dicom_multi_view.render import (
     BASE_MAX_HEIGHT_PX,
     ComposeLayout,
     compose_section_rgb,
+    native_isotropic_mm,
+    sample_section_image_roi,
     shared_mm_per_px,
     title_strip,
 )
@@ -26,6 +28,12 @@ from dicom_multi_view.section import (
     suggest_labels,
     sync_continuous_tops,
 )
+
+# Opt-in high quality: native HU sample of the selected section's visible ROI.
+# Overview path stays default (fast pan/zoom). Debounce when High is on.
+DETAIL_DEBOUNCE_MS = 120
+DETAIL_MAX_PATCH_PX = 6_000_000
+DISPLAY_PIXEL_BUDGET = 40_000_000
 
 
 @dataclass
@@ -141,8 +149,10 @@ class MultiViewGui(tk.Tk):
 
         self.sections: list[LoadedSection] = []
         self._photo: ImageTk.PhotoImage | None = None
+        self._detail_photos: list[ImageTk.PhotoImage] = []
         self._base_sheet: Image.Image | None = None
         self._sheet_layouts: list[SectionSheetLayout] = []
+        self._overview_mm_per_px: float = 1.0
         self._zoom = 1.0
         self._min_zoom = 0.05
         self._max_zoom = 8.0
@@ -150,6 +160,7 @@ class MultiViewGui(tk.Tk):
         self._plane_job: str | None = None
         self._win_job: str | None = None
         self._marker_job: str | None = None
+        self._detail_job: str | None = None
         self._ignore_plane = False
         self._ignore_top = False
         self._ignore_insets = False
@@ -162,6 +173,8 @@ class MultiViewGui(tk.Tk):
         self.status = tk.StringVar(
             value="Add folder… · drag cyan/amber core guides · shared zoom/pan · scale in cm"
         )
+        # Opt-in: native ROI for the selected section only (never auto on zoom).
+        self.high_quality = tk.BooleanVar(value=False)
         self.layout_mode = tk.StringVar(value="side")  # side | stack
         # continuous: tops from sum of core lengths (manual tops respected)
         # per: each section uses its own top (default 0)
@@ -434,9 +447,19 @@ class MultiViewGui(tk.Tk):
             side=tk.LEFT, padx=(0, 2)
         )
         ttk.Button(vr, text="Zoom −", command=lambda: self._zoom_by(1 / 1.25)).pack(side=tk.LEFT)
+        ttk.Checkbutton(
+            view_fr,
+            text="High quality (selected section, visible region)",
+            variable=self.high_quality,
+            command=self._on_high_quality_toggle,
+        ).pack(anchor="w", pady=(6, 0))
         view_help = ttk.Label(
             view_fr,
-            text="Wheel zooms toward cursor · drag pans · shared physical cm scale + zoom",
+            text=(
+                "Wheel zooms toward cursor · drag pans · shared physical cm scale + zoom. "
+                "Default is lightweight overview; enable High quality for a sharper "
+                "native sample of the selected section’s visible area (debounced)."
+            ),
             wraplength=380,
         )
         view_help.pack(anchor="w", pady=(4, 0))
@@ -467,6 +490,14 @@ class MultiViewGui(tk.Tk):
         self.canvas.bind("<ButtonRelease-1>", self._canvas_release)
         self.canvas.bind("<ButtonPress-2>", self._pan_start)
         self.canvas.bind("<B2-Motion>", self._pan_move)
+        self.canvas.bind("<ButtonRelease-2>", lambda _e: self._schedule_detail_refresh())
+        # Scrollbars: update view; refresh High-quality ROI only when that mode is on.
+        self.hbar.configure(command=self._on_xview)
+        self.vbar.configure(command=self._on_yview)
+        self.canvas.configure(
+            xscrollcommand=self._on_xscroll_set,
+            yscrollcommand=self._on_yscroll_set,
+        )
 
         # Place sash after geometry is realized (~420 px left panel)
         self.after_idle(lambda: self._set_left_sash(420))
@@ -747,6 +778,9 @@ class MultiViewGui(tk.Tk):
         )
         self.plane_help.set(sec.slider_help)
         self._sync_window_controls()
+        # Selected section drives High-quality ROI.
+        if self.high_quality.get():
+            self._schedule_detail_refresh(immediate=True)
 
     def _on_plane_slide(self, _val=None) -> None:
         if self._ignore_plane:
@@ -966,12 +1000,43 @@ class MultiViewGui(tk.Tk):
 
     # ----- shared zoom / pan / core guides -----
 
+    def _on_xview(self, *args) -> None:
+        self.canvas.xview(*args)
+        self._schedule_detail_refresh()
+
+    def _on_yview(self, *args) -> None:
+        self.canvas.yview(*args)
+        self._schedule_detail_refresh()
+
+    def _on_xscroll_set(self, first: str, last: str) -> None:
+        self.hbar.set(first, last)
+
+    def _on_yscroll_set(self, first: str, last: str) -> None:
+        self.vbar.set(first, last)
+
+    def _on_high_quality_toggle(self) -> None:
+        if self.high_quality.get():
+            self._schedule_detail_refresh(immediate=True)
+            self.status.set("High quality on — selected section visible region (debounced).")
+        else:
+            self._clear_detail_overlays()
+            self.zoom_label.set(f"Zoom: {int(round(self._zoom * 100))}% (shared)")
+            self.status.set("Overview quality — fast pan/zoom.")
+
     def _pan_start(self, event) -> None:
         self.canvas.scan_mark(event.x, event.y)
         self.canvas.focus_set()
+        if self.high_quality.get():
+            # Drop stale high-res tile while dragging; overview stays snappy.
+            self.canvas.delete("detail")
+            self._detail_photos.clear()
+            if self._detail_job is not None:
+                self.after_cancel(self._detail_job)
+                self._detail_job = None
 
     def _pan_move(self, event) -> None:
         self.canvas.scan_dragto(event.x, event.y, gain=1)
+        self._schedule_detail_refresh()
 
     def _marker_y_base(self, lay: SectionSheetLayout, which: str) -> float:
         sec = self.sections[lay.index]
@@ -1010,6 +1075,9 @@ class MultiViewGui(tk.Tk):
             self.listbox.selection_set(idx)
             self._on_select()
             self.canvas.focus_set()
+            if self.high_quality.get():
+                self.canvas.delete("detail")
+                self._detail_photos.clear()
             self.status.set(
                 f"Dragging core {'top' if which == 'top' else 'bottom'} guide…"
             )
@@ -1069,6 +1137,9 @@ class MultiViewGui(tk.Tk):
                 self._marker_job = None
             self._commit_marker_drag()
             self.status.set("Core bounds updated.")
+            return
+        # End of pan drag — refresh High-quality ROI if enabled.
+        self._schedule_detail_refresh()
 
     def _on_mousewheel(self, event) -> None:
         factor = 1.15 if event.delta > 0 else 1 / 1.15
@@ -1114,20 +1185,22 @@ class MultiViewGui(tk.Tk):
         z = self._zoom
         w = max(1, int(round(self._base_sheet.width * z)))
         h = max(1, int(round(self._base_sheet.height * z)))
-        if w * h > 40_000_000:
+        if w * h > DISPLAY_PIXEL_BUDGET:
             z = max(
                 self._min_zoom,
-                (40_000_000 / (self._base_sheet.width * self._base_sheet.height)) ** 0.5,
+                (DISPLAY_PIXEL_BUDGET / (self._base_sheet.width * self._base_sheet.height))
+                ** 0.5,
             )
             self._zoom = z
             w = max(1, int(round(self._base_sheet.width * z)))
             h = max(1, int(round(self._base_sheet.height * z)))
             self.status.set("Zoom capped for display size — use Fit width.")
 
+        self._clear_detail_overlays()
         disp = self._base_sheet.resize((w, h), Image.Resampling.BILINEAR)
         self._photo = ImageTk.PhotoImage(disp)
         self.canvas.delete("all")
-        self.canvas.create_image(0, 0, anchor="nw", image=self._photo)
+        self.canvas.create_image(0, 0, anchor="nw", image=self._photo, tags=("base",))
         self.canvas.configure(scrollregion=(0, 0, w, h))
         self.zoom_label.set(f"Zoom: {int(round(z * 100))}% (shared)")
 
@@ -1141,6 +1214,125 @@ class MultiViewGui(tk.Tk):
                 self.canvas.xview_moveto(max(0.0, left / w))
             if h > 0:
                 self.canvas.yview_moveto(max(0.0, top / h))
+
+        # High quality is opt-in only — never auto on zoom.
+        self._schedule_detail_refresh()
+
+    def _clear_detail_overlays(self) -> None:
+        if self._detail_job is not None:
+            self.after_cancel(self._detail_job)
+            self._detail_job = None
+        self.canvas.delete("detail")
+        self._detail_photos.clear()
+
+    def _schedule_detail_refresh(self, *, immediate: bool = False) -> None:
+        """No-op unless High quality is on (keeps overview pan/zoom snappy)."""
+        if not self.high_quality.get():
+            return
+        if self._detail_job is not None:
+            self.after_cancel(self._detail_job)
+            self._detail_job = None
+        if immediate:
+            self._refresh_detail_overlays()
+            return
+        self._detail_job = self.after(DETAIL_DEBOUNCE_MS, self._refresh_detail_overlays)
+
+    def _visible_base_rect(self) -> tuple[float, float, float, float] | None:
+        """Visible canvas area in pre-zoom base-sheet coordinates."""
+        if self._base_sheet is None:
+            return None
+        z = max(self._zoom, 1e-9)
+        cw = max(self.canvas.winfo_width(), 1)
+        ch = max(self.canvas.winfo_height(), 1)
+        x0 = self.canvas.canvasx(0) / z
+        y0 = self.canvas.canvasy(0) / z
+        x1 = self.canvas.canvasx(cw) / z
+        y1 = self.canvas.canvasy(ch) / z
+        return (
+            max(0.0, float(x0)),
+            max(0.0, float(y0)),
+            min(float(self._base_sheet.width), float(x1)),
+            min(float(self._base_sheet.height), float(y1)),
+        )
+
+    def _refresh_detail_overlays(self) -> None:
+        """Native-sample the selected section's visible ROI (High quality mode)."""
+        self._detail_job = None
+        self.canvas.delete("detail")
+        self._detail_photos.clear()
+        if not self.high_quality.get() or self._base_sheet is None:
+            return
+        idx = self._selected_index()
+        if idx is None:
+            return
+        lay = next((L for L in self._sheet_layouts if L.index == idx), None)
+        if lay is None or not (0 <= idx < len(self.sections)):
+            return
+        sec = self.sections[idx]
+        z = max(self._zoom, 1e-9)
+        ov = self._overview_mm_per_px
+        native = native_isotropic_mm(sec)
+        # Skip if overview is already as sharp as native at this zoom.
+        if ov / z <= native * 1.02:
+            self.zoom_label.set(f"Zoom: {int(round(self._zoom * 100))}% (shared)")
+            return
+
+        vis = self._visible_base_rect()
+        if vis is None:
+            return
+        vx0, vy0, vx1, vy1 = vis
+        ix0 = float(lay.img_x0)
+        iy0 = float(lay.img_y0)
+        ix1 = ix0 + float(lay.layout.img_w)
+        iy1 = iy0 + float(lay.layout.img_h)
+        rx0 = max(vx0, ix0)
+        ry0 = max(vy0, iy0)
+        rx1 = min(vx1, ix1)
+        ry1 = min(vy1, iy1)
+        if rx1 - rx0 < 2 or ry1 - ry0 < 2:
+            return
+
+        out_w = max(1, int(round((rx1 - rx0) * z)))
+        out_h = max(1, int(round((ry1 - ry0) * z)))
+        if out_w * out_h > DETAIL_MAX_PATCH_PX:
+            scale = (DETAIL_MAX_PATCH_PX / (out_w * out_h)) ** 0.5
+            out_w = max(1, int(out_w * scale))
+            out_h = max(1, int(out_h * scale))
+
+        try:
+            patch = sample_section_image_roi(
+                sec,
+                x0=rx0 - ix0,
+                y0=ry0 - iy0,
+                x1=rx1 - ix0,
+                y1=ry1 - iy0,
+                overview_mm_per_px=ov,
+                out_w=out_w,
+                out_h=out_h,
+                win_lo=sec.win_lo,
+                win_hi=sec.win_hi,
+                draw_guides=True,
+            )
+        except Exception:
+            return
+
+        screen_w = max(1, int(round((rx1 - rx0) * z)))
+        screen_h = max(1, int(round((ry1 - ry0) * z)))
+        if patch.size != (screen_w, screen_h):
+            patch = patch.resize((screen_w, screen_h), Image.Resampling.BILINEAR)
+
+        photo = ImageTk.PhotoImage(patch)
+        self._detail_photos.append(photo)
+        self.canvas.create_image(
+            rx0 * z,
+            ry0 * z,
+            anchor="nw",
+            image=photo,
+            tags=("detail",),
+        )
+        self.zoom_label.set(
+            f"Zoom: {int(round(self._zoom * 100))}% (shared) · high quality"
+        )
 
     def rebuild(self, *, fit_after: bool = False) -> None:
         if self._rebuild_job is not None:
@@ -1157,10 +1349,12 @@ class MultiViewGui(tk.Tk):
         self._rebuild_job = self.after(30, _do)
 
     def _compose_base(self) -> None:
+        self._clear_detail_overlays()
         self.canvas.delete("all")
         self._photo = None
         self._base_sheet = None
         self._sheet_layouts = []
+        self._overview_mm_per_px = 1.0
         if not self.sections:
             self.canvas.create_text(
                 24,
@@ -1177,6 +1371,7 @@ class MultiViewGui(tk.Tk):
             max_height_px=BASE_MAX_HEIGHT_PX,
             max_width_px=900,
         )
+        self._overview_mm_per_px = float(mm_px)
         tiles: list[Image.Image] = []
         body_layouts: list[ComposeLayout] = []
         title_hs: list[int] = []

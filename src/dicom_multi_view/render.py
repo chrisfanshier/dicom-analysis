@@ -177,6 +177,100 @@ class ComposeLayout:
         return self.img_h
 
 
+def native_isotropic_mm(section: LoadedSection) -> float:
+    """Finest isotropic mm/px available from the current native ``image_hu``."""
+    return float(
+        min(
+            max(float(section.depth_mm_per_px), 1e-12),
+            max(float(section.across_mm_per_px), 1e-12),
+        )
+    )
+
+
+def sample_section_image_roi(
+    section: LoadedSection,
+    *,
+    x0: float,
+    y0: float,
+    x1: float,
+    y1: float,
+    overview_mm_per_px: float,
+    out_w: int,
+    out_h: int,
+    win_lo: float | None = None,
+    win_hi: float | None = None,
+    draw_guides: bool = True,
+) -> Image.Image:
+    """
+    Sample a section-image ROI from native ``image_hu`` into ``out_w``×``out_h`` RGB.
+
+    ``(x0,y0)–(x1,y1)`` are in overview compose image pixels (origin = top-left of
+    the greyscale body, not the scale bar). Used for progressive detail when the
+    shared overview bitmap is bilinear-stretched by zoom.
+    """
+    out_w = max(1, int(out_w))
+    out_h = max(1, int(out_h))
+    if x1 <= x0 or y1 <= y0:
+        return Image.new("RGB", (out_w, out_h), (20, 20, 22))
+
+    if win_lo is None:
+        win_lo = section.win_lo
+    if win_hi is None:
+        win_hi = section.win_hi
+
+    mm = max(float(overview_mm_per_px), 1e-12)
+    # Physical ROI (mm) from section image origin.
+    left_mm = float(x0) * mm
+    right_mm = float(x1) * mm
+    top_mm = float(y0) * mm
+    bot_mm = float(y1) * mm
+
+    d_mm = max(float(section.depth_mm_per_px), 1e-12)
+    a_mm = max(float(section.across_mm_per_px), 1e-12)
+    h0, w0 = section.image_hu.shape
+
+    r0 = int(np.floor(top_mm / d_mm))
+    r1 = int(np.ceil(bot_mm / d_mm))
+    c0 = int(np.floor(left_mm / a_mm))
+    c1 = int(np.ceil(right_mm / a_mm))
+    r0 = int(np.clip(r0, 0, h0))
+    r1 = int(np.clip(max(r1, r0 + 1), 0, h0))
+    c0 = int(np.clip(c0, 0, w0))
+    c1 = int(np.clip(max(c1, c0 + 1), 0, w0))
+
+    crop = section.image_hu[r0:r1, c0:c1]
+    u8 = hu_to_u8(crop, win_lo, win_hi)
+    img = Image.fromarray(np.stack([u8, u8, u8], axis=-1), mode="RGB")
+    if img.size != (out_w, out_h):
+        # BICUBIC reads sharper than BILINEAR when upscaling a small native crop.
+        resample = (
+            Image.Resampling.BICUBIC
+            if (out_w > img.width or out_h > img.height)
+            else Image.Resampling.BILINEAR
+        )
+        img = img.resize((out_w, out_h), resample)
+
+    if draw_guides:
+        # Map full-image guide rows (overview px) into this ROI patch.
+        depth_cm_per_px = mm / 10.0
+        extent_cm = (section.image_hu.shape[0] * d_mm) / 10.0
+        top_inset = max(0.0, min(float(section.core_top_inset_cm), extent_cm))
+        bottom_inset = max(
+            0.0, min(float(section.core_bottom_inset_cm), extent_cm - top_inset)
+        )
+        y_top_ov = top_inset / max(depth_cm_per_px, 1e-12)
+        y_bot_ov = (extent_cm - bottom_inset) / max(depth_cm_per_px, 1e-12) - 1.0
+        scale_y = out_h / max(float(y1 - y0), 1e-12)
+        draw = ImageDraw.Draw(img)
+        for y_ov, color in ((y_top_ov, (80, 200, 255)), (y_bot_ov, (255, 180, 80))):
+            if y0 - 1.0 <= y_ov <= y1 + 1.0:
+                yi = int(round((y_ov - y0) * scale_y))
+                yi = int(np.clip(yi, 0, out_h - 1))
+                draw.line([(0, yi), (out_w - 1, yi)], fill=color, width=2)
+
+    return img
+
+
 def compose_section_rgb(
     section: LoadedSection,
     *,
