@@ -242,11 +242,11 @@ def sample_section_image_roi(
     u8 = hu_to_u8(crop, win_lo, win_hi)
     img = Image.fromarray(np.stack([u8, u8, u8], axis=-1), mode="RGB")
     if img.size != (out_w, out_h):
-        # BICUBIC reads sharper than BILINEAR when upscaling a small native crop.
+        # LANCZOS reads sharper than BILINEAR when upscaling a native crop past overview.
         resample = (
-            Image.Resampling.BICUBIC
+            Image.Resampling.LANCZOS
             if (out_w > img.width or out_h > img.height)
-            else Image.Resampling.BILINEAR
+            else Image.Resampling.BOX
         )
         img = img.resize((out_w, out_h), resample)
 

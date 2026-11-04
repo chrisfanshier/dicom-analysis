@@ -284,16 +284,32 @@ class MultiViewGui(tk.Tk):
             side=tk.LEFT
         )
 
-        list_fr = ttk.LabelFrame(left, text="Sections (order)", padding=4)
+        list_fr = ttk.LabelFrame(
+            left, text="Sections (select one — required for High quality)", padding=4
+        )
         list_fr.grid(row=3, column=0, sticky="ew", pady=(0, 6))
         list_fr.columnconfigure(0, weight=1)
-        self.listbox = tk.Listbox(list_fr, exportselection=False, height=8)
+        self.listbox = tk.Listbox(
+            list_fr,
+            exportselection=False,
+            height=8,
+            activestyle="dotbox",
+            selectbackground="#2a6a9a",
+            selectforeground="#ffffff",
+        )
         self.listbox.grid(row=0, column=0, sticky="ew")
         sb = ttk.Scrollbar(list_fr, orient=tk.VERTICAL, command=self.listbox.yview)
         sb.grid(row=0, column=1, sticky="ns")
         self.listbox.configure(yscrollcommand=sb.set)
         self.listbox.bind("<<ListboxSelect>>", self._on_select)
         self.listbox.bind("<Double-Button-1>", lambda _e: self.edit_selected())
+        list_hint = ttk.Label(
+            list_fr,
+            text="Highlight a section in the list; High quality sharpens that section’s visible area.",
+            wraplength=360,
+        )
+        list_hint.grid(row=1, column=0, columnspan=2, sticky="w", pady=(4, 0))
+        self._wrap_labels.append(list_hint)
 
         depth_fr = ttk.LabelFrame(left, text="Depth scale (cm)", padding=6)
         depth_fr.grid(row=4, column=0, sticky="ew", pady=(0, 6))
@@ -457,8 +473,8 @@ class MultiViewGui(tk.Tk):
             view_fr,
             text=(
                 "Wheel zooms toward cursor · drag pans · shared physical cm scale + zoom. "
-                "Default is lightweight overview; enable High quality for a sharper "
-                "native sample of the selected section’s visible area (debounced)."
+                "Default is lightweight overview; zoom in on a selected section, then enable "
+                "High quality for a sharper native sample of its visible area (debounced)."
             ),
             wraplength=380,
         )
@@ -630,8 +646,26 @@ class MultiViewGui(tk.Tk):
         if self.scale_mode.get() == "continuous":
             sync_continuous_tops(self.sections)
         self._rebuild_list()
+        if self.sections:
+            self.listbox.selection_set(min(i, len(self.sections) - 1))
+            self._on_select()
         self.rebuild()
         self.status.set("Removed section.")
+
+    def _ensure_section_selected(self) -> int | None:
+        """Return selected index; auto-select first section if the list has items.
+
+        Does not call ``_on_select`` (avoids re-entrant High-quality refresh).
+        """
+        idx = self._selected_index()
+        if idx is not None:
+            return idx
+        if not self.sections:
+            return None
+        self.listbox.selection_set(0)
+        self.listbox.activate(0)
+        self.listbox.see(0)
+        return 0
 
     def move_selected(self, delta: int) -> None:
         i = self._selected_index()
@@ -1016,8 +1050,22 @@ class MultiViewGui(tk.Tk):
 
     def _on_high_quality_toggle(self) -> None:
         if self.high_quality.get():
+            if not self.sections:
+                self.high_quality.set(False)
+                self.status.set("High quality needs a loaded section — Add folder… first.")
+                return
+            idx = self._ensure_section_selected()
+            if idx is None:
+                self.high_quality.set(False)
+                self.status.set("High quality needs a selected section in the list.")
+                return
+            # Sync side panel if we just auto-selected; also kicks an immediate HQ refresh.
+            self._on_select()
+            self.status.set(
+                f"High quality on — sharpening “{self.sections[idx].display_label}” "
+                f"(visible region)…"
+            )
             self._schedule_detail_refresh(immediate=True)
-            self.status.set("High quality on — selected section visible region (debounced).")
         else:
             self._clear_detail_overlays()
             self.zoom_label.set(f"Zoom: {int(round(self._zoom * 100))}% (shared)")
@@ -1262,19 +1310,29 @@ class MultiViewGui(tk.Tk):
         self._detail_photos.clear()
         if not self.high_quality.get() or self._base_sheet is None:
             return
-        idx = self._selected_index()
+        idx = self._ensure_section_selected()
         if idx is None:
+            self.status.set("High quality: select a section in the list.")
+            self.zoom_label.set(f"Zoom: {int(round(self._zoom * 100))}% (shared)")
             return
         lay = next((L for L in self._sheet_layouts if L.index == idx), None)
         if lay is None or not (0 <= idx < len(self.sections)):
+            self.status.set("High quality: selected section has no layout yet — try rebuild.")
             return
         sec = self.sections[idx]
         z = max(self._zoom, 1e-9)
         ov = self._overview_mm_per_px
         native = native_isotropic_mm(sec)
-        # Skip if overview is already as sharp as native at this zoom.
-        if ov / z <= native * 1.02:
-            self.zoom_label.set(f"Zoom: {int(round(self._zoom * 100))}% (shared)")
+        # Overview base already near-native: re-sampling cannot add sharpness.
+        # (Do NOT use ov/z here — that wrongly skipped detail exactly when zoomed in.)
+        if ov <= native * 1.02:
+            self.zoom_label.set(
+                f"Zoom: {int(round(self._zoom * 100))}% (shared) · HQ N/A (native)"
+            )
+            self.status.set(
+                "High quality: overview is already near native resolution — "
+                "nothing sharper to show at this scale."
+            )
             return
 
         vis = self._visible_base_rect()
@@ -1290,14 +1348,21 @@ class MultiViewGui(tk.Tk):
         rx1 = min(vx1, ix1)
         ry1 = min(vy1, iy1)
         if rx1 - rx0 < 2 or ry1 - ry0 < 2:
+            self.zoom_label.set(f"Zoom: {int(round(self._zoom * 100))}% (shared) · HQ")
+            self.status.set(
+                f"High quality: “{sec.display_label}” is not in the visible region — "
+                "pan so that section is on screen."
+            )
             return
 
-        out_w = max(1, int(round((rx1 - rx0) * z)))
-        out_h = max(1, int(round((ry1 - ry0) * z)))
-        if out_w * out_h > DETAIL_MAX_PATCH_PX:
-            scale = (DETAIL_MAX_PATCH_PX / (out_w * out_h)) ** 0.5
-            out_w = max(1, int(out_w * scale))
-            out_h = max(1, int(out_h * scale))
+        # Sample native HU at screen pixel size for this ROI (sharper than bilinear overview).
+        screen_w = max(1, int(round((rx1 - rx0) * z)))
+        screen_h = max(1, int(round((ry1 - ry0) * z)))
+        sample_w, sample_h = screen_w, screen_h
+        if sample_w * sample_h > DETAIL_MAX_PATCH_PX:
+            scale = (DETAIL_MAX_PATCH_PX / (sample_w * sample_h)) ** 0.5
+            sample_w = max(1, int(sample_w * scale))
+            sample_h = max(1, int(sample_h * scale))
 
         try:
             patch = sample_section_image_roi(
@@ -1307,22 +1372,22 @@ class MultiViewGui(tk.Tk):
                 x1=rx1 - ix0,
                 y1=ry1 - iy0,
                 overview_mm_per_px=ov,
-                out_w=out_w,
-                out_h=out_h,
+                out_w=sample_w,
+                out_h=sample_h,
                 win_lo=sec.win_lo,
                 win_hi=sec.win_hi,
                 draw_guides=True,
             )
-        except Exception:
+        except Exception as exc:
+            self.status.set(f"High quality failed: {exc}")
             return
 
-        screen_w = max(1, int(round((rx1 - rx0) * z)))
-        screen_h = max(1, int(round((ry1 - ry0) * z)))
         if patch.size != (screen_w, screen_h):
-            patch = patch.resize((screen_w, screen_h), Image.Resampling.BILINEAR)
+            patch = patch.resize((screen_w, screen_h), Image.Resampling.LANCZOS)
 
         photo = ImageTk.PhotoImage(patch)
         self._detail_photos.append(photo)
+        # Draw above the overview base (create order / raise tag).
         self.canvas.create_image(
             rx0 * z,
             ry0 * z,
@@ -1330,8 +1395,20 @@ class MultiViewGui(tk.Tk):
             image=photo,
             tags=("detail",),
         )
+        try:
+            self.canvas.tag_raise("detail", "base")
+        except tk.TclError:
+            pass
+        gain = ov / max(native, 1e-12)
         self.zoom_label.set(
             f"Zoom: {int(round(self._zoom * 100))}% (shared) · high quality"
+        )
+        tip = ""
+        if z < 1.05:
+            tip = " Zoom in further for a clearer difference vs overview."
+        self.status.set(
+            f"High quality: sharpened “{sec.display_label}” "
+            f"(~{gain:.1f}× finer source than overview).{tip}"
         )
 
     def rebuild(self, *, fit_after: bool = False) -> None:
