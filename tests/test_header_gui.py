@@ -71,6 +71,25 @@ class HeaderStateTests(unittest.TestCase):
             st.set_move(*st.move_mm)  # a manual change afterwards drops the refine record
             self.assertIsNone(st.refine_info)
 
+    def test_undo_refine_restores_the_earlier_position_and_the_live_correlation_is_shown(self) -> None:
+        with tempfile.TemporaryDirectory() as t:
+            rig = Rig(Path(t), btm_header_error_z=2.0)
+            st = self._state(rig)
+            self.assertIn("Join correlation on this slice", st.summary())
+            before = st.join_correlation()
+            self.assertTrue(st.refine().applied)
+            self.assertTrue(st.can_undo_refine())
+            self.assertGreater(st.join_correlation(), before)
+            self.assertTrue(st.undo_refine())
+            self.assertEqual(st.move_mm, [0.0, 0.0, 0.0])
+            self.assertIsNone(st.refine_info)
+            self.assertAlmostEqual(st.join_correlation(), before, places=6)
+            self.assertFalse(st.undo_refine())  # nothing left to undo
+            # a manual shift after a refine drops the undo
+            st.refine()
+            st.set_move(0.0, 0.0, 0.0)
+            self.assertFalse(st.can_undo_refine())
+
     def test_refine_leaves_a_correct_placement_alone(self) -> None:
         st = self._state()
         out = st.refine()

@@ -286,7 +286,10 @@ class StitchGui(tk.Tk):
             "placement, which interpolates the bottom half.",
             wraplength=320, font=("", 8),
         ).pack(anchor=tk.W)
-        ttk.Button(parent, text="Refine join", command=self._hdr_refine).pack(fill=tk.X, pady=(10, 0))
+        rj = ttk.Frame(parent)
+        rj.pack(fill=tk.X, pady=(10, 0))
+        ttk.Button(rj, text="Refine join", command=self._hdr_refine).pack(side=tk.LEFT, fill=tk.X, expand=True)
+        ttk.Button(rj, text="Undo refine", command=self._hdr_undo_refine).pack(side=tk.LEFT, padx=(6, 0))
         ttk.Label(parent, textvariable=self.hdr_refine_note, wraplength=320, font=("", 8)).pack(anchor=tk.W)
         ttk.Label(parent, textvariable=self.hdr_refine_result, wraplength=320, font=("", 9, "bold")).pack(anchor=tk.W, pady=(2, 0))
         ttk.Button(parent, text="Re-align from image (mask + profile)", command=self._hdr_realign).pack(
@@ -726,6 +729,16 @@ class StitchGui(tk.Tk):
         else:
             self.hdr_refine_result.set(out.note + (f" (correlation {out.score_before:.4f}.)" if out.score_before == out.score_before else ""))
             self.status.set("Refine made no change.")
+        self._schedule_refresh()
+
+    def _hdr_undo_refine(self) -> None:
+        if not self._hdr_active() or not self.single.undo_refine():
+            self.status.set("Nothing to undo: no refine since the last change.")
+            return
+        self.hdr_refine_result.set("Refine undone: back to the position before it.")
+        self._hdr_sync()
+        self._sync_single_controls()
+        self.status.set("Refine undone.")
         self._schedule_refresh()
 
     def _hdr_realign(self) -> None:

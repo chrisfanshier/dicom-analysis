@@ -49,6 +49,7 @@ class HeaderState:
         self.move_mm = [0.0, 0.0, 0.0]  # bottom half, from its header position: along, across, depth
         self.moved_by = "scanner header"  # or "image alignment" after Re-align
         self.refine_info: dict | None = None  # set by refine(); cleared when the shift is changed by hand
+        self._undo: tuple | None = None  # (move_mm, moved_by, refine_info) from before the last refine
         self.window_lo: float | None = None
         self.window_hi: float | None = None
         self.warnings: list[str] = []
@@ -76,6 +77,7 @@ class HeaderState:
             self.moved_by = source
         if not keep_refine:
             self.refine_info = None
+            self._undo = None  # a hand shift makes the old refine undo meaningless
         self._replan()
         self.frame = int(np.clip(self.frame, 0, self.plan.n_slices - 1))
         self._render()
@@ -130,6 +132,7 @@ class HeaderState:
                                  "Refine's best position is a fraction of a pixel and whole-pixel placement can't hold it "
                                  f"(it would lower the join correlation from {before_corr:.4f} to {after_corr:.4f}), so nothing "
                                  "was changed. Untick whole-pixel placement to use the sub-pixel position.", out.iterations)
+        self._undo = (before_move, before_by, before_info)
         if not self.moved_by.endswith("+ refine"):
             self.moved_by += " + refine"
         self.refine_info = {
@@ -142,6 +145,19 @@ class HeaderState:
             "iterations": out.iterations,
         }
         return RefineOutcome(out.along_mm, out.across_mm, before_corr, after_corr, True, "", out.iterations)
+
+    def can_undo_refine(self) -> bool:
+        return self._undo is not None
+
+    def undo_refine(self) -> bool:
+        """Put the position back to what it was before the last Refine join."""
+        if self._undo is None:
+            return False
+        move, by, info = self._undo
+        self.set_move(*move, source=by, keep_refine=True)
+        self.refine_info = info
+        self._undo = None
+        return True
 
     def refine_note(self) -> str:
         """What a refined shift will cost in resampling, for this pair, in plain words."""
@@ -242,6 +258,9 @@ class HeaderState:
             + ("" if not any(abs(x) > 1e-9 for x in self.move_mm) else
                f" + shift along {self.move_mm[0]:+.1f} / across {self.move_mm[1]:+.1f} / depth {self.move_mm[2]:+.1f} mm"),
         ]
+        c = self.join_correlation()
+        if c == c:  # not NaN
+            lines.append(f"Join correlation on this slice: {c:.4f} (higher = the halves agree better in the overlap).")
         return "\n".join(lines)
 
     def check_text(self) -> tuple[str, bool]:
