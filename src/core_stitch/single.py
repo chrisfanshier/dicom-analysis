@@ -36,6 +36,31 @@ class SingleState:
     def spacing_mm(self) -> float:
         return self.half.target_mm
 
+    # the calls the GUI makes of any single-image mode (shared with HeaderState)
+    kind = "single"
+
+    def set_frame(self, frame: int) -> None:
+        set_frame(self, frame)
+
+    def auto_window(self) -> tuple[float, float]:
+        return auto_window(self)
+
+    def window_limits(self) -> tuple[float, float]:
+        return window_limits(self)
+
+    def crop_box(self, pad_mm: float = 3.0) -> tuple[int, int, int, int]:
+        return crop_box(self, pad_mm)
+
+    def gray_preview(self, pad_mm: float = 3.0, crop: bool = True) -> np.ndarray:
+        return gray_preview(self, pad_mm, crop)
+
+    def core_mask(self) -> np.ndarray:
+        return self.half.mask
+
+    def hu_values(self) -> np.ndarray:
+        v = self.half.image[self.half.mask]
+        return v if v.size else self.half.image.ravel()
+
 
 def prepare_single(
     path: Path | str, series_uid: str | None = None, frame: int | None = None

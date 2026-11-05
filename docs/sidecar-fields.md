@@ -138,6 +138,34 @@ Added when the export was started from the Worklist tab.
 
 ---
 
+### Stitches placed from the scanner geometry (sidecar version 0.2.0)
+
+These exports come from the scanner-geometry (SimpleITK) mode. They have `"engine": "simpleitk_header_geometry"`
+and `"stitched": true`. The two halves are put where the scanner recorded them (from the DICOM headers),
+the half with the finer pixels is kept exactly as scanned, and the other half is resampled once onto its grid.
+The older fields in the table above (`fixed`, `mobile`, `flip`, `roll_deg`, `nudge_*`, `total_lag_px`,
+`refine`, ...) are not present in these files; the blocks below replace them.
+
+| Field | Plain meaning |
+|---|---|
+| `engine`, `software` | The method, and the SimpleITK version that did the resampling. |
+| `top`, `bottom` | The two scans joined: series ID, description, their original pixel size (`native_mm_per_px`) and slice step. |
+| `resolution.output_mm_per_px` | Pixel size of the stitched picture, in mm. It is the finer of the two scans' pixel sizes. |
+| `resolution.reference_half` | The half that was kept exactly as scanned (`top` or `bottom`). |
+| `resolution.interpolated_half` | The half that was resampled to the finer pixel size, or `null` if both already matched. |
+| `resolution.upsample_factor_of_interpolated_half` | How much finer the pixels were made (1.58 means 1.58 times). Interpolated pixels are smoothed estimates; they add no new detail. |
+| `resolution.interpolation` | How the resampling was done (`linear`, or nearest-neighbour when every voxel kept its original value). |
+| `placement.source` | Where the position came from: `scanner header` (as recorded), or `image alignment (mask + profile)` if you used Re-align from image. |
+| `placement.bottom_shift_mm` | Any shift you applied to the bottom half from that position, in mm: `along_core` (+ is down), `across_core`, `through_stack`. All zero means the scanner position was used as is. |
+| `placement.pixel_placement`, `snapped_to_whole_pixel`, `snap_residual_mm` | When both halves have the same pixel size, "whole_pixel" places the bottom half to the nearest whole pixel so every voxel stays original; the residual is how far that moved it (at most half a pixel). |
+| `header_check` | A check made when the pair was loaded: do the scanner positions agree with the images? `verdict` is `headers_good` or `needs_image_stitch`, with the reasons, the sideways and depth differences in mm, and the correlation of the two cores' profiles at the scanner position. |
+| `join.overlap_rows_in_image` | The rows of the exported picture where both halves overlap (first row, last row). |
+| `join.overlap_cm` | Length of the overlap, in cm. |
+| `join.top_rows_in_image`, `bottom_rows_in_image` | The rows of the picture that each half covers. |
+| `join.fuse` | How the halves were combined in the overlap (the average, except right at each half's image edge, where only the other half is used). |
+| `join.outside_core_fill_hu` | The HU value used outside the core (real air). |
+| `view_slice`, `n_slices` | Which slice the 2D picture shows, and how many slices the stack has. |
+
 ## Example: building a ruler in Python
 
 ```python

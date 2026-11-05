@@ -14,16 +14,8 @@ from core_stitch.export import _crop_box as _export_crop_box
 from core_stitch.export import export_accept
 from core_stitch.overlap import FUSE_MODES
 from core_stitch.scale import auto_bounds
-from core_stitch.single import (
-    SingleState,
-    auto_window as single_auto_window,
-    crop_box as single_crop_box,
-    export_single,
-    gray_preview,
-    prepare_single,
-    set_frame as single_set_frame,
-    window_limits as single_window_limits,
-)
+from core_stitch.header_state import HeaderState, export_header
+from core_stitch.single import SingleState, export_single, prepare_single
 from core_stitch.scale_gui import CoreGuides
 from core_stitch.worklist_gui import WorklistPanel
 from core_stitch.pipeline import (
@@ -62,8 +54,18 @@ class StitchGui(tk.Tk):
         self.current_job = None  # worklist Job being stitched, if any
         self.worklist: WorklistPanel | None = None
         self.state: StitchState | None = None
-        self.single: SingleState | None = None  # a scan with only one view (nothing to stitch)
+        # Any single-image mode: a scan with only one view (SingleState) or the scanner-geometry
+        # stitch (HeaderState). Both answer the same questions (frame, window, crop, preview).
+        self.single: SingleState | HeaderState | None = None
         self.mode_note = tk.StringVar(value="")
+        self.use_scanner_geometry = tk.BooleanVar(value=True)
+        self.hdr_along = tk.DoubleVar(value=0.0)
+        self.hdr_across = tk.DoubleVar(value=0.0)
+        self.hdr_depth = tk.DoubleVar(value=0.0)
+        self.hdr_whole_pixel = tk.BooleanVar(value=True)
+        self.hdr_info = tk.StringVar(value="")
+        self.hdr_check = tk.StringVar(value="")
+        self._hdr_job: str | None = None
         self._scale = 1.0  # canvas px per image px
         self._fit = 1.0
         self._guide_offset = 0
@@ -221,7 +223,80 @@ class StitchGui(tk.Tk):
             anchor=tk.W, pady=(0, 8)
         )
 
-        ttk.Button(parent, text="Run coarse align", command=self.run_coarse).pack(
+        ttk.Checkbutton(
+            parent,
+            text="Use scanner geometry for worklist pairs (SimpleITK)",
+            variable=self.use_scanner_geometry,
+        ).pack(anchor=tk.W, pady=(0, 4))
+        ttk.Button(parent, text="Load pair with scanner geometry", command=self.load_header_pair).pack(
+            fill=tk.X, pady=(0, 8)
+        )
+        self._old_align = ttk.Frame(parent)
+        self._hdr_align = ttk.Frame(parent)
+        self._build_old_align(self._old_align)
+        self._build_header_align(self._hdr_align)
+        self._set_align_mode("old")
+
+    def _set_align_mode(self, mode: str) -> None:
+        """Show the controls for the current mode: older mask method, or scanner geometry."""
+        self._old_align.pack_forget()
+        self._hdr_align.pack_forget()
+        if mode == "old":
+            self._old_align.pack(fill=tk.X)
+        elif mode == "header":
+            self._hdr_align.pack(fill=tk.X)
+
+    def _build_header_align(self, parent: ttk.Frame) -> None:
+        parent.columnconfigure(0, weight=1)
+        self._hdr_check_label = ttk.Label(parent, textvariable=self.hdr_check, wraplength=320, font=("", 9, "bold"))
+        self._hdr_check_label.pack(anchor=tk.W, pady=(0, 6))
+        ttk.Label(parent, textvariable=self.hdr_info, wraplength=320, justify=tk.LEFT).pack(anchor=tk.W, pady=(0, 8))
+
+        box = ttk.LabelFrame(parent, text="Shift bottom half from scanner position (mm)", padding=6)
+        box.pack(fill=tk.X)
+        rows = (
+            ("Along the core (+ = down)", self.hdr_along),
+            ("Across the core", self.hdr_across),
+            ("Through the stack", self.hdr_depth),
+        )
+        for label, var in rows:
+            row = ttk.Frame(box)
+            row.pack(fill=tk.X, pady=2)
+            ttk.Label(row, text=label, width=24).pack(side=tk.LEFT)
+            sb = ttk.Spinbox(row, from_=-1000, to=1000, increment=0.5, width=8, textvariable=var, command=self._hdr_apply_soon)
+            sb.pack(side=tk.LEFT)
+            sb.bind("<Return>", lambda _e: self._hdr_apply_soon())
+            sb.bind("<FocusOut>", lambda _e: self._hdr_apply_soon())
+        ttk.Label(
+            box, text="Arrow keys: 1 mm (Shift = 5). Left/Right = across, Up/Down = along.", font=("", 8), wraplength=320
+        ).pack(anchor=tk.W, pady=(4, 0))
+        ttk.Button(box, text="Reset to scanner position", command=self._hdr_reset).pack(anchor=tk.W, pady=(4, 0))
+
+        ttk.Checkbutton(
+            parent,
+            text="Whole-pixel placement when both halves share a pixel size",
+            variable=self.hdr_whole_pixel,
+            command=self._hdr_apply_soon,
+        ).pack(anchor=tk.W, pady=(8, 0))
+        ttk.Label(
+            parent,
+            text="On: every voxel stays as scanned (placement good to half a pixel). Off: sub-pixel "
+            "placement, which interpolates the bottom half.",
+            wraplength=320, font=("", 8),
+        ).pack(anchor=tk.W)
+        ttk.Button(parent, text="Re-align from image (mask + profile)", command=self._hdr_realign).pack(
+            fill=tk.X, pady=(10, 0)
+        )
+        ttk.Label(
+            parent,
+            text="Use this only if the scanner position is way off. It runs the older mask + profile "
+            "alignment (about a minute) and starts from its answer.",
+            wraplength=320, font=("", 8),
+        ).pack(anchor=tk.W)
+
+    def _build_old_align(self, parent: ttk.Frame) -> None:
+        parent.columnconfigure(0, weight=1)
+        ttk.Button(parent, text="Run coarse align (older mask method)", command=self.run_coarse).pack(
             fill=tk.X, pady=(0, 4)
         )
         ttk.Button(parent, text="Refine join", command=self.run_refine).pack(
@@ -520,9 +595,119 @@ class StitchGui(tk.Tk):
         self.path_a_var.set(str(job.a.path))
         self.path_b_var.set(str(job.b.path))
         self._notebook.select(self._tab_align)
+        if self.use_scanner_geometry.get():
+            self.load_header_pair(job)
+            return
         self.run_coarse()
         if self.state is None:
             self.current_job = None
+
+    # ----- scanner-geometry (SimpleITK) stitch -----
+
+    def _hdr_active(self) -> bool:
+        return isinstance(self.single, HeaderState) and self.state is None
+
+    def load_header_pair(self, job=None) -> None:
+        """Show TOP + BTM where the scanner put them (DICOM header geometry)."""
+        if job is not None:
+            self.current_job = job
+            self.path_a, self.path_b = job.a.path, job.b.path
+            self.uid_a, self.uid_b = job.a.series_uid, job.b.series_uid
+            self.path_a_var.set(str(job.a.path))
+            self.path_b_var.set(str(job.b.path))
+        if not self.path_a or not self.path_b:
+            messagebox.showinfo("Need folders", "Select both TOP and BTM series folders.")
+            return
+        self.status.set("Loading both halves and placing them from the scanner geometry...")
+        self.update_idletasks()
+        placement = "whole_pixel" if self.hdr_whole_pixel.get() else "subpixel"
+        try:
+            st = HeaderState.load(self.path_a, self.uid_a, self.path_b, self.uid_b, placement=placement)
+        except Exception as exc:
+            messagebox.showerror("Scanner geometry", str(exc))
+            self.status.set(f"Load failed: {exc}")
+            if job is not None:
+                self.current_job = None
+            return
+        self.state = None
+        self.single = st
+        self.mode_note.set("")
+        self.guides.reset()
+        self.zoom_var.set(1.0)
+        self._set_align_mode("header")
+        self._hdr_sync()
+        self._sync_single_controls()
+        self._sync_window_from_state()
+        self._notebook.select(self._tab_align)
+        self.status.set("Placed from the scanner geometry. Check the join, shift if needed, then Export.")
+        self._schedule_refresh()
+
+    def _hdr_sync(self) -> None:
+        """Copy the state's shift and text into the controls."""
+        st = self.single
+        if not isinstance(st, HeaderState):
+            return
+        self.hdr_along.set(round(st.move_mm[0], 3))
+        self.hdr_across.set(round(st.move_mm[1], 3))
+        self.hdr_depth.set(round(st.move_mm[2], 3))
+        self.hdr_info.set(st.summary())
+        text, ok = st.check_text()
+        self.hdr_check.set(text)
+        self._hdr_check_label.configure(foreground="#15803d" if ok else "#b45309")
+
+    def _hdr_apply_soon(self) -> None:
+        if self._hdr_job is not None:
+            self.after_cancel(self._hdr_job)
+        self._hdr_job = self.after(250, self._hdr_apply)
+
+    def _hdr_apply(self) -> None:
+        self._hdr_job = None
+        st = self.single
+        if not self._hdr_active():
+            return
+        try:
+            a, b, d = float(self.hdr_along.get()), float(self.hdr_across.get()), float(self.hdr_depth.get())
+        except (TypeError, ValueError, tk.TclError):
+            return
+        self.status.set("Re-placing the bottom half...")
+        self.update_idletasks()
+        try:
+            st.placement = "whole_pixel" if self.hdr_whole_pixel.get() else "subpixel"
+            moved = any(abs(x) > 1e-9 for x in (a, b, d))
+            st.set_move(a, b, d, source=None if moved else "scanner header")
+        except Exception as exc:
+            messagebox.showerror("Shift", str(exc))
+            self.status.set(f"Shift failed: {exc}")
+            return
+        self._hdr_sync()
+        self._sync_single_controls()
+        self.status.set("Updated.")
+        self._schedule_refresh()
+
+    def _hdr_reset(self) -> None:
+        if not self._hdr_active():
+            return
+        self.single.set_move(0.0, 0.0, 0.0, source="scanner header")
+        self._hdr_sync()
+        self._sync_single_controls()
+        self._schedule_refresh()
+
+    def _hdr_realign(self) -> None:
+        if not self._hdr_active():
+            messagebox.showinfo("Re-align", "Load a pair first.")
+            return
+        self.status.set("Re-aligning from the images (mask + profile)... this takes about a minute.")
+        self.update_idletasks()
+        try:
+            self.single.realign_from_image()
+        except Exception as exc:
+            messagebox.showerror("Re-align failed", str(exc))
+            self.status.set(f"Re-align failed: {exc}")
+            return
+        self._hdr_sync()
+        self._sync_single_controls()
+        self.status.set("Placed from the image alignment. Check the join, then Export.")
+        self._schedule_refresh()
 
     def load_single_job(self, job) -> None:
         """A scan with only one view: same window, no join. Window, ends, then Export."""
@@ -546,6 +731,7 @@ class StitchGui(tk.Tk):
         )
         self.guides.reset()
         self.zoom_var.set(1.0)
+        self._set_align_mode("none")
         self._sync_single_controls()
         self._sync_window_from_state()
         self._notebook.select(self._tab_display)
@@ -575,6 +761,7 @@ class StitchGui(tk.Tk):
             return
         self.single = None
         self.mode_note.set("")
+        self._set_align_mode("old")
         self.flip_var.set(False)
         self.roll_var.set(0.0)
         self.fuse_mode.set(self.state.fuse_mode)
@@ -648,7 +835,7 @@ class StitchGui(tk.Tk):
                 z = int(self.z_var.get())
             except (TypeError, ValueError, tk.TclError):
                 return
-            single_set_frame(self.single, z)
+            self.single.set_frame(z)
             self._sync_single_controls()
             self._schedule_refresh()
             return
@@ -798,6 +985,11 @@ class StitchGui(tk.Tk):
         self._apply_nudge()
 
     def _nudge_keys(self, dx: float, dy: float) -> None:
+        if self._hdr_active():
+            self.hdr_across.set(round(float(self.hdr_across.get()) + dx, 3))
+            self.hdr_along.set(round(float(self.hdr_along.get()) + dy, 3))
+            self._hdr_apply_soon()
+            return
         if self.state is None:
             return
         r = float(self.nudge_range.get())
@@ -857,16 +1049,14 @@ class StitchGui(tk.Tk):
 
     def _hu_values(self) -> np.ndarray:
         if self.state is None and self.single is not None:
-            h = self.single.half
-            v = h.image[h.mask]
-            return v if v.size else h.image.ravel()
+            return self.single.hu_values()
         return masked_hu_values(self.state)
 
     def _sync_window_from_state(self) -> None:
         if not self._has_image():
             return
         if self.state is None:
-            lo, hi = single_window_limits(self.single)
+            lo, hi = self.single.window_limits()
         else:
             lo, hi = window_limits(self.state)
         vals = self._hu_values()
@@ -896,7 +1086,7 @@ class StitchGui(tk.Tk):
         if not self._has_image():
             return
         if self.state is None:
-            single_auto_window(self.single)
+            self.single.auto_window()
         else:
             set_auto_window(self.state)
         self._sync_window_from_state()
@@ -1003,8 +1193,9 @@ class StitchGui(tk.Tk):
         return g.expected_length_cm if g else None
 
     def accept_export(self) -> None:
-        single = self.single is not None and self.state is None
-        if self.state is None and not single:
+        hdr = self._hdr_active()
+        single = self.single is not None and self.state is None and not hdr
+        if self.state is None and not single and not hdr:
             messagebox.showinfo("Export", "Run coarse align first.")
             return
         jpeg = bool(self.export_jpeg.get())
@@ -1012,11 +1203,11 @@ class StitchGui(tk.Tk):
         js = bool(self.export_json.get())
         # a single view has no DICOM stack or NumPy fusion to write
         dicom = False if single else bool(self.export_dicom.get())
-        npy = False if single else bool(self.export_npy.get())
+        npy = False if (single or hdr) else bool(self.export_npy.get())
         if not any((jpeg, tiff, dicom, npy, js)):
             messagebox.showinfo("Export", "Select at least one export type.")
             return
-        if not single and self.state.low_confidence:
+        if not single and not hdr and self.state.low_confidence:
             if not messagebox.askyesno(
                 "Low confidence",
                 "Overlap is marked low confidence." + chr(10) + "Export anyway?",
@@ -1035,7 +1226,20 @@ class StitchGui(tk.Tk):
         self.status.set("Exporting selected products…")
         self.update_idletasks()
         try:
-            if single:
+            if hdr:
+                paths = export_header(
+                    self.single,
+                    out,
+                    stem=target.stem if target else "stitch",
+                    extra_meta=target.extra_meta if target else None,
+                    jpeg=jpeg,
+                    tiff=tiff,
+                    dicom=dicom,
+                    json_sidecar=js,
+                    core_bounds=self.guides.bounds(),
+                    scale_out=scale,
+                )
+            elif single:
                 paths = export_single(
                     self.single,
                     out,
@@ -1181,9 +1385,9 @@ class StitchGui(tk.Tk):
             return
         try:
             if single:
-                arr = gray_preview(self.single)
-                box = single_crop_box(self.single)
-                mask = self.single.half.mask
+                arr = self.single.gray_preview()
+                box = self.single.crop_box(3.0)
+                mask = self.single.core_mask()
                 spacing = self.single.spacing_mm
                 offset = 0
             else:

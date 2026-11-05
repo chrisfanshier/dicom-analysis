@@ -67,3 +67,16 @@ scan groups as cruise -> core -> section. Release folder: `$CORE_STITCH_RELEASE`
   Field-by-field guide for users: [docs/sidecar-fields.md](docs/sidecar-fields.md).
 
 Tests: `python -m unittest discover -s tests`.
+
+## Scanner-geometry mode (experimental, SimpleITK)
+
+On this branch a worklist pair first appears **where the scanner put it** (the DICOM header geometry), in the
+Align tab. A banner says whether the scanner placement agrees with the images. If it does, check the join and
+export. If not, shift the bottom half by hand (arrow keys or the three boxes), or press **Re-align from image**,
+which runs the older core-mask + profile alignment and starts from its answer.
+
+The half with the finer pixels is kept exactly as scanned; the other half is resampled once onto its grid.
+Tick or untick **Whole-pixel placement** to choose between keeping every voxel original (when both halves share a
+pixel size) and sub-pixel placement. The older mask-based workflow is still there ("Use scanner geometry" box).
+The sidecar for these exports is described in [docs/sidecar-fields.md](docs/sidecar-fields.md).
+

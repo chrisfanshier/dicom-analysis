@@ -73,6 +73,29 @@ class ItkStitch:
     info: dict = field(default_factory=dict)
 
 
+@dataclass
+class Plan:
+    """Everything decided before any voxel is resampled (cheap to compute)."""
+
+    top: Half
+    bottom: Half
+    ref: Half
+    mov: Half
+    move: np.ndarray  # shift of the moving half in physical space (mm), after any whole-pixel snap
+    move_mm_bottom: tuple[float, float, float]
+    placement: str
+    same_lattice: bool
+    snapped: bool
+    snap_residual_mm: float
+    lo: np.ndarray  # first output index, in reference-lattice units
+    size: list[int]  # output size (x, y, z)
+    crop_pad_mm: float | None
+
+    @property
+    def n_slices(self) -> int:
+        return int(self.size[2])
+
+
 def _direction(row: np.ndarray, col: np.ndarray) -> tuple[np.ndarray, tuple[float, ...]]:
     normal = np.cross(row, col)
     d = np.column_stack([row, col, normal])
@@ -119,20 +142,15 @@ def _same_lattice(a: Half, b: Half) -> bool:
     return ds < SAME_TOL and dd < SAME_TOL
 
 
-def stitch_pair(
-    top_folder: Path | str,
-    top_uid: str | None,
-    bottom_folder: Path | str,
-    bottom_uid: str | None,
+def plan_stitch(
+    top: Half,
+    bottom: Half,
     *,
     move_mm: tuple[float, float, float] = (0.0, 0.0, 0.0),
     placement: str = "whole_pixel",
-    interpolator: str = "linear",
-    trim_rows: int = 3,
     crop_pad_mm: float | None = None,
-    halves: tuple[Half, Half] | None = None,
-) -> ItkStitch:
-    """Stitch TOP and BOTTOM using the header geometry.
+) -> Plan:
+    """Choose the reference, apply the optional shift and size the output grid (no resampling).
 
     ``move_mm`` = shift of the bottom half from its header position, as
     (along the core, across the core, through the stack).
@@ -141,12 +159,8 @@ def stitch_pair(
     """
     if placement not in PLACEMENTS:
         raise ValueError(f"placement must be one of {PLACEMENTS}")
-    if interpolator not in INTERPOLATORS:
-        raise ValueError(f"interpolator must be one of {tuple(INTERPOLATORS)}")
-    top, bottom = halves if halves else (load_half("top", top_folder, top_uid), load_half("bottom", bottom_folder, bottom_uid))
     if not np.allclose(np.r_[top.row_dir, top.col_dir], np.r_[bottom.row_dir, bottom.col_dir], atol=SAME_TOL):
         raise ValueError("The two halves have different orientations; header placement does not apply")
-
     # reference = finer in-plane pixel (top wins a tie)
     pitch = lambda h: min(h.spacing_xyz[0], h.spacing_xyz[1])
     ref, mov = (top, bottom) if pitch(top) <= pitch(bottom) + SAME_TOL else (bottom, top)
@@ -184,6 +198,35 @@ def stitch_pair(
         lo[0] = max(lo[0], int(np.floor(min(ci) - pad)))
         hi[0] = min(hi[0], int(np.ceil(max(ci) + pad)))
     size = (hi - lo + 1).tolist()
+    return Plan(top=top, bottom=bottom, ref=ref, mov=mov, move=move, move_mm_bottom=tuple(float(x) for x in move_mm),
+                placement=placement, same_lattice=bool(same), snapped=bool(snapped), snap_residual_mm=snap_residual_mm,
+                lo=lo, size=size, crop_pad_mm=crop_pad_mm)
+
+
+def render_plan(
+    plan: Plan,
+    *,
+    interpolator: str = "linear",
+    trim_rows: int = 3,
+    z_keep: tuple[int, int] | None = None,
+) -> ItkStitch:
+    """Resample both halves onto the planned grid and fuse them.
+
+    ``z_keep=(first, last)`` renders only those output slices (fast preview of one slice).
+    """
+    if interpolator not in INTERPOLATORS:
+        raise ValueError(f"interpolator must be one of {tuple(INTERPOLATORS)}")
+    ref, mov, move = plan.ref, plan.mov, plan.move
+    rimg, mimg = ref.image, mov.image
+    placement, same, snapped = plan.placement, plan.same_lattice, plan.snapped
+    snap_residual_mm, move_mm, crop_pad_mm = plan.snap_residual_mm, plan.move_mm_bottom, plan.crop_pad_mm
+    lo = plan.lo.copy()
+    size = list(plan.size)
+    if z_keep is not None:
+        z0 = int(np.clip(z_keep[0], 0, plan.n_slices - 1))
+        z1 = int(np.clip(z_keep[1], z0, plan.n_slices - 1))
+        lo[2] = lo[2] + z0
+        size[2] = z1 - z0 + 1
     grid = sitk.Image(size, sitk.sitkFloat32)
     grid.SetSpacing(rimg.GetSpacing())
     grid.SetDirection(rimg.GetDirection())
@@ -253,6 +296,26 @@ def stitch_pair(
     )
     return ItkStitch(volume=out, grid=grid, reference=ref, moving=mov, ref_vol=ref_vol, mov_vol=mov_vol,
                      ref_footprint=ref_fp, mov_footprint=mov_fp, ref_core=ref_core, mov_core=mov_core, info=info)
+
+
+def stitch_pair(
+    top_folder: Path | str,
+    top_uid: str | None,
+    bottom_folder: Path | str,
+    bottom_uid: str | None,
+    *,
+    move_mm: tuple[float, float, float] = (0.0, 0.0, 0.0),
+    placement: str = "whole_pixel",
+    interpolator: str = "linear",
+    trim_rows: int = 3,
+    crop_pad_mm: float | None = None,
+    halves: tuple[Half, Half] | None = None,
+    z_keep: tuple[int, int] | None = None,
+) -> ItkStitch:
+    """Stitch TOP and BOTTOM using the header geometry (plan, then render)."""
+    top, bottom = halves if halves else (load_half("top", top_folder, top_uid), load_half("bottom", bottom_folder, bottom_uid))
+    plan = plan_stitch(top, bottom, move_mm=move_mm, placement=placement, crop_pad_mm=crop_pad_mm)
+    return render_plan(plan, interpolator=interpolator, trim_rows=trim_rows, z_keep=z_keep)
 
 
 def image_based_move_mm(
