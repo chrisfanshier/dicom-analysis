@@ -159,10 +159,32 @@ def _spacing(items: list[tuple[Path, Dataset]]) -> tuple[float, float, float]:
     return (z_mm, row_mm, col_mm)
 
 
-def load_series(series_dir: Path | str) -> MprSeries:
+def select_uid_group(
+    items: list[tuple[Path, Dataset]], series_uid: str
+) -> tuple[str, list[tuple[Path, Dataset]]]:
+    """Keep the files of one SeriesInstanceUID (largest shape group if it has several).
+
+    The release catalog stores only the last 12 characters of each UID
+    (e.g. ``33191.951896``), so a UID that ends with ``series_uid`` matches too.
+    """
+    def _hit(ds: Dataset) -> bool:
+        uid = str(getattr(ds, "SeriesInstanceUID", ""))
+        return uid == series_uid or (len(series_uid) >= 8 and uid.endswith(series_uid))
+
+    mine = [(p, ds) for p, ds in items if _hit(ds)]
+    if not mine:
+        raise FileNotFoundError(f"Series {series_uid} not found among {len(items)} files")
+    return select_primary_group(mine)
+
+
+def load_series(series_dir: Path | str, series_uid: str | None = None) -> MprSeries:
+    """Load one series from a folder. ``series_uid`` picks it when a folder holds several."""
     series_dir = Path(series_dir)
     items = discover(series_dir)
-    uid, items = select_primary_group(items)
+    if series_uid:
+        uid, items = select_uid_group(items, series_uid)
+    else:
+        uid, items = select_primary_group(items)
     items = sort_slices(items)
     arrays = [_hu(ds) for _, ds in items]
     shapes = {a.shape for a in arrays}

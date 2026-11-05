@@ -13,6 +13,7 @@ from pydicom.dataset import Dataset, FileDataset, FileMetaDataset
 from pydicom.uid import ExplicitVRLittleEndian, generate_uid
 
 from core_stitch.overlap import fuse_preview
+from core_stitch.scale import auto_bounds, core_scale_block, dpi_for
 from core_stitch.pipeline import (
     StitchState,
     build_stitched_mpr,
@@ -174,17 +175,16 @@ def export_accept(
     dicom: bool = True,
     npy: bool = True,
     json_sidecar: bool = True,
-    sediment_mask: bool = False,
-    sediment_roi_image: bool = False,
     pad_mm: float = 3.0,
+    extra_meta: dict | None = None,
+    core_bounds: tuple[float, float, str] | None = None,
+    scale_out: dict | None = None,
 ) -> dict[str, Path | str]:
     """
     Export selected products. Greyscale JPEG/TIFF use the current HU window.
 
     TIFF is 8-bit LZW (lossless twin of the windowed JPEG) plus a 16-bit HU
     TIFF (`*_hu.tif`) when TIFF is enabled.
-
-    Sediment extras (optional Analyze step): mask TIFF/NPY and ROI-clipped 2D.
     """
     if not any(
         (
@@ -193,8 +193,6 @@ def export_accept(
             dicom,
             npy,
             json_sidecar,
-            sediment_mask,
-            sediment_roi_image,
         )
     ):
         raise ValueError("Select at least one export type")
@@ -204,6 +202,8 @@ def export_accept(
     paths: dict[str, Path | str] = {}
 
     meta = sidecar_dict(state)
+    if extra_meta:
+        meta.update(extra_meta)
     meta["exported_at"] = datetime.now(timezone.utc).isoformat()
     meta["export_view_z"] = state.view_z
     meta["export_jpeg_pad_mm"] = pad_mm
@@ -224,16 +224,28 @@ def export_accept(
             opacity_b=1.0,
             crop_core=True,
             pad_mm=pad_mm,
-            overlay_sediment=False,
-            downcore_plot=False,
         )
         meta["export_shape_px"] = [int(gray.shape[0]), int(gray.shape[1])]
         meta["export_jpeg_cropped"] = True
+        if core_bounds is None:
+            t_cm, b_cm = auto_bounds(state.mask_a | state.mask_b, box, state.spacing_mm)  # type: ignore[operator]
+            core_bounds = (t_cm, b_cm, "auto")
+        meta["core_scale"] = core_scale_block(
+            gray.shape[:2],
+            state.spacing_mm,
+            core_bounds[0],
+            core_bounds[1],
+            source=core_bounds[2],
+            expected_length_cm=(extra_meta or {}).get("catalog_section_length_cm"),
+        )
+        if scale_out is not None:
+            scale_out.update(meta['core_scale'])
 
     if jpeg and gray is not None:
         jpg_path = out_dir / f"{stem}.jpg"
         Image.fromarray(gray, mode="L").save(
-            jpg_path, format="JPEG", quality=95, optimize=True
+            jpg_path, format="JPEG", quality=95, optimize=True,
+            dpi=(dpi_for(state.spacing_mm),) * 2,
         )
         meta["export_jpeg"] = str(jpg_path)
         paths["jpeg"] = jpg_path
@@ -241,7 +253,8 @@ def export_accept(
     if tiff and gray is not None:
         tif_path = out_dir / f"{stem}.tif"
         Image.fromarray(gray, mode="L").save(
-            tif_path, format="TIFF", compression="tiff_lzw"
+            tif_path, format="TIFF", compression="tiff_lzw",
+            dpi=(dpi_for(state.spacing_mm),) * 2,
         )
         meta["export_tiff"] = str(tif_path)
         paths["tiff"] = tif_path
@@ -252,7 +265,8 @@ def export_accept(
         hu16 = np.clip(np.rint(hu - hu_min), 0, 65535).astype(np.uint16)
         tif_hu = out_dir / f"{stem}_hu.tif"
         Image.fromarray(hu16, mode="I;16").save(
-            tif_hu, format="TIFF", compression="tiff_lzw"
+            tif_hu, format="TIFF", compression="tiff_lzw",
+            dpi=(dpi_for(state.spacing_mm),) * 2,
         )
         meta["export_tiff_hu"] = str(tif_hu)
         meta["export_tiff_hu_offset"] = hu_min
@@ -303,69 +317,6 @@ def export_accept(
         meta["export_mpr_shape_zyx"] = [int(x) for x in volume.shape]
         meta["export_mpr_z_spacing_mm"] = float(z_mm)
         paths["mpr_npy"] = vol_npy
-
-    if sediment_mask or sediment_roi_image:
-        if state.sediment is None or state.sediment.mask_2d is None:
-            raise ValueError("Sediment ROI not defined — run Analyze → Auto sediment first")
-
-    if sediment_mask and state.sediment is not None and state.sediment.mask_2d is not None:
-        m2 = crop_to_box(state.sediment.mask_2d.astype(np.uint8) * 255, box)
-        m2_path = out_dir / f"{stem}_sediment_mask.tif"
-        Image.fromarray(m2, mode="L").save(m2_path, format="TIFF", compression="tiff_lzw")
-        meta["export_sediment_mask_tif"] = str(m2_path)
-        paths["sediment_mask_tif"] = m2_path
-        m2_npy = out_dir / f"{stem}_sediment_mask.npy"
-        np.save(m2_npy, crop_to_box(state.sediment.mask_2d, box))
-        meta["export_sediment_mask_npy"] = str(m2_npy)
-        paths["sediment_mask_npy"] = m2_npy
-
-        # 3D mask only if Analyze → Apply to all Z was run
-        if state.sediment.mask_3d is not None:
-            m3_npy = out_dir / f"{stem}_sediment_mask_mpr.npy"
-            np.save(m3_npy, state.sediment.mask_3d)
-            meta["export_sediment_mask_mpr_npy"] = str(m3_npy)
-            meta["export_sediment_mask_mpr_shape"] = [
-                int(x) for x in state.sediment.mask_3d.shape
-            ]
-            paths["sediment_mask_mpr_npy"] = m3_npy
-
-    if sediment_roi_image and state.sediment is not None and state.sediment.mask_2d is not None:
-        # Windowed greyscale clipped to sediment (no overlay tint)
-        roi_gray = preview_arrays(
-            state,
-            align_mode=False,
-            opacity_a=1.0,
-            opacity_b=1.0,
-            crop_core=False,
-            pad_mm=pad_mm,
-            overlay_sediment=False,
-            downcore_plot=False,
-        )
-        sm = state.sediment.mask_2d
-        if roi_gray.ndim == 2:
-            clipped = np.where(sm, roi_gray, 0).astype(np.uint8)
-        else:
-            clipped = roi_gray.copy()
-            clipped[~sm] = 0
-        clipped = crop_to_box(clipped, box)
-        roi_tif = out_dir / f"{stem}_sediment_roi.tif"
-        if clipped.ndim == 2:
-            Image.fromarray(clipped, mode="L").save(
-                roi_tif, format="TIFF", compression="tiff_lzw"
-            )
-        else:
-            Image.fromarray(clipped, mode="RGB").save(
-                roi_tif, format="TIFF", compression="tiff_lzw"
-            )
-        meta["export_sediment_roi_tif"] = str(roi_tif)
-        paths["sediment_roi_tif"] = roi_tif
-        hu = crop_to_box(fused_hu(state), box)
-        smc = crop_to_box(sm, box)
-        hu_roi = np.where(smc, hu, np.nan).astype(np.float32)
-        roi_npy = out_dir / f"{stem}_sediment_roi.npy"
-        np.save(roi_npy, hu_roi)
-        meta["export_sediment_roi_npy"] = str(roi_npy)
-        paths["sediment_roi_npy"] = roi_npy
 
     if json_sidecar:
         json_path = out_dir / f"{stem}.json"

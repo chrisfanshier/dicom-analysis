@@ -31,23 +31,6 @@ from core_stitch.overlap import (
     search_overlap,
     upright_angle,
 )
-from core_stitch.analyze import (
-    HU_HIST_BINS,
-    HU_HIST_HI,
-    HU_HIST_LO,
-    DowncoreProfile,
-    SedimentRoi,
-    build_sediment_mask_2d,
-    build_sediment_mask_3d,
-    class_masks_from_hu,
-    detect_sediment_from_profile,
-    mean_hu_per_row,
-    multi_otsu_two_thresholds,
-    overlay_sediment_circle_xz,
-    overlay_sediment_classes_rgb,
-    overlay_sediment_rgb,
-    render_downcore_plot_rgb,
-)
 from core_stitch.refine import RefineResult, _shift_stack_z, refine_join_volumes
 from core_stitch.segment import mid_slice, segment_core
 
@@ -104,16 +87,6 @@ class StitchState:
     canvas_b: np.ndarray | None = None
     mask_a: np.ndarray | None = None
     mask_b: np.ndarray | None = None
-    sediment: SedimentRoi | None = None
-    show_sediment: bool = True
-    show_downcore_plot: bool = False
-    # Cached fused XZ plane for compact QC panel: key, HU (Z,W), mask (Z,W)
-    _xz_cache_key: tuple | None = None
-    _xz_hu: np.ndarray | None = None
-    _xz_mask: np.ndarray | None = None
-    # Cached downcore mean HU inside sediment cylinder
-    _downcore_cache_key: tuple | None = None
-    _downcore_profile: DowncoreProfile | None = None
     warnings: list[str] = field(default_factory=list)
 
     @property
@@ -134,9 +107,11 @@ class StitchState:
         return int(round(self.nudge_x_mm / self.spacing_mm))
 
 
-def _prepare_half(series: MprSeries, target_mm: float) -> tuple[HalfPrepared, list[str]]:
+def _prepare_half(
+    series: MprSeries, target_mm: float, frame: int | None = None
+) -> tuple[HalfPrepared, list[str]]:
     warns: list[str] = []
-    img0 = mid_slice(series.volume)
+    img0 = mid_slice(series.volume) if frame is None else series.volume[int(frame)]
     seg = segment_core(img0)
     if seg.n_components == 0:
         raise ValueError(f"No core mask found in {series.path}")
@@ -171,10 +146,19 @@ def _prepare_half(series: MprSeries, target_mm: float) -> tuple[HalfPrepared, li
     )
 
 
-def coarse_align(path_a: Path | str, path_b: Path | str) -> StitchState:
-    """Load A/B, resample, segment, upright, lateral-align B to A, run overlap."""
-    sa = load_series(path_a)
-    sb = load_series(path_b)
+def coarse_align(
+    path_a: Path | str,
+    path_b: Path | str,
+    uid_a: str | None = None,
+    uid_b: str | None = None,
+) -> StitchState:
+    """Load A/B, resample, segment, upright, lateral-align B to A, run overlap.
+
+    ``uid_a`` / ``uid_b`` pick a series by SeriesInstanceUID when both parts sit
+    in one folder (catalog ``parts_in_one_folder`` layout).
+    """
+    sa = load_series(path_a, uid_a)
+    sb = load_series(path_b, uid_b)
     target = float(
         min(sa.spacing_mm[1], sa.spacing_mm[2], sb.spacing_mm[1], sb.spacing_mm[2])
     )
@@ -223,16 +207,6 @@ def _mobile_posed(state: StitchState) -> tuple[np.ndarray, np.ndarray]:
 
 def invalidate_posed(state: StitchState) -> None:
     state.posed = None
-    state._xz_cache_key = None
-    state._xz_hu = None
-    state._xz_mask = None
-    state._downcore_cache_key = None
-    state._downcore_profile = None
-
-
-def invalidate_downcore_profile(state: StitchState) -> None:
-    state._downcore_cache_key = None
-    state._downcore_profile = None
 
 
 def prepare_posed_volumes(
@@ -324,9 +298,6 @@ def recompose_at_z(state: StitchState, z: int) -> None:
     state.canvas_b = cb
     state.mask_a = ma
     state.mask_b = mb
-    if state.sediment is not None:
-        # center_z stays at Auto-detect (cylinder fixed while browsing Z)
-        rebuild_sediment_mask_2d(state)
 
 
 def recompose(state: StitchState) -> None:
@@ -350,8 +321,6 @@ def recompose(state: StitchState) -> None:
     state.canvas_b = cb
     state.mask_a = ma
     state.mask_b = mb
-    if state.sediment is not None:
-        rebuild_sediment_mask_2d(state)
 
 
 def recompute_overlap(state: StitchState, *, reset_nudge: bool = True) -> OverlapResult:
@@ -488,452 +457,6 @@ def fused_hu(state: StitchState) -> np.ndarray:
     )
 
 
-def core_union_mask(state: StitchState) -> np.ndarray:
-    assert state.mask_a is not None and state.mask_b is not None
-    return state.mask_a | state.mask_b
-
-
-def rebuild_sediment_mask_2d(state: StitchState) -> None:
-    """Refresh cylinder chord + optional class masks at current view Z."""
-    if state.sediment is None or state.mask_a is None:
-        return
-    sed = state.sediment
-    z_mm = state.posed.z_mm if state.posed is not None else None
-    view_z = float(state.view_z) if state.view_z is not None else None
-    cyl = build_sediment_mask_2d(
-        core_union_mask(state),
-        center_col_px=sed.center_col_px,
-        radius_mm=sed.radius_mm,
-        spacing_mm=state.spacing_mm,
-        erode_mm=sed.erode_mm,
-        nudge_x_mm=sed.nudge_x_mm,
-        view_z=view_z,
-        center_z=sed.center_z,
-        spacing_z_mm=z_mm,
-        nudge_z_mm=sed.nudge_z_mm,
-    )
-    sed.mask_2d = cyl
-    if sed.has_thresholds and state.canvas_a is not None:
-        include, low, high = class_masks_from_hu(
-            fused_hu(state),
-            cyl,
-            thr_lo=float(sed.thr_lo_hu),  # type: ignore[arg-type]
-            thr_hi=float(sed.thr_hi_hu),  # type: ignore[arg-type]
-            exclude_low=sed.exclude_low,
-            exclude_high=sed.exclude_high,
-        )
-        sed.mask_include_2d = include
-        sed.mask_low_2d = low
-        sed.mask_high_2d = high
-    else:
-        sed.mask_include_2d = cyl
-        sed.mask_low_2d = None
-        sed.mask_high_2d = None
-
-
-def detect_sediment_roi(
-    state: StitchState,
-    *,
-    liner_od_mm: float | None = None,
-    liner_wall_mm: float | None = None,
-) -> SedimentRoi:
-    """Outside-in liner/void peel on current fused slice; store on state."""
-    assert state.canvas_a is not None
-    img = fused_hu(state)
-    mask = core_union_mask(state)
-    prev = state.sediment
-    od = liner_od_mm if liner_od_mm is not None else (prev.liner_od_mm if prev else None)
-    wall = (
-        liner_wall_mm
-        if liner_wall_mm is not None
-        else (prev.liner_wall_mm if prev else None)
-    )
-    cx, radius_mm, liner_hu, void_hu, note = detect_sediment_from_profile(
-        img,
-        mask,
-        spacing_mm=state.spacing_mm,
-        liner_od_mm=od,
-        liner_wall_mm=wall,
-    )
-    cz = float(state.view_z if state.view_z is not None else 0)
-    sed = SedimentRoi(
-        center_col_px=cx,
-        center_z=cz,
-        radius_mm=radius_mm,
-        erode_mm=prev.erode_mm if prev else 0.0,
-        nudge_x_mm=prev.nudge_x_mm if prev else 0.0,
-        nudge_z_mm=prev.nudge_z_mm if prev else 0.0,
-        liner_od_mm=od,
-        liner_wall_mm=wall,
-        liner_hu=liner_hu,
-        void_hu=void_hu,
-        method="outside_in",
-        note=note,
-        exclude_low=prev.exclude_low if prev else True,
-        exclude_high=prev.exclude_high if prev else True,
-        # New geometry → clear thresholds until Auto Otsu / downcore compute
-        thr_lo_hu=None,
-        thr_hi_hu=None,
-        filter_method="none",
-    )
-    state.sediment = sed
-    rebuild_sediment_mask_2d(state)
-    return sed
-
-
-def build_sediment_volume_mask(state: StitchState) -> np.ndarray:
-    """
-    Build (Z,H,W) sediment cylinder using posed stacks' content masks + ROI.
-
-    Requires posed volumes; uses compose geometry via per-Z core masks on canvas
-    size — builds from posed half masks composed like preview.
-    """
-    if state.sediment is None:
-        raise ValueError("No sediment ROI — run detect first")
-    posed = ensure_posed(state)
-    sed = state.sediment
-    # Compose core masks per Z onto canvas (same lag/col as preview)
-    from core_stitch.overlap import compose_canvases
-
-    lag = state.total_lag_px
-    col = state.total_col_offset_px
-    vol_b, mask_b = posed.vol_b, posed.mask_b
-    dz_px = int(round(state.nudge_z_mm / max(posed.z_mm, 1e-6)))
-    if dz_px != 0:
-        vol_b, mask_b = _shift_stack_z(
-            vol_b, mask_b, dz_px, cval=state.mobile_base.air
-        )
-    cores = []
-    for z in range(posed.n_slices):
-        _ca, _cb, ma, mb = compose_canvases(
-            posed.vol_a[z],
-            posed.mask_a[z],
-            vol_b[z],
-            mask_b[z],
-            lag,
-            col_offset_px=col,
-            cval=state.fixed.air,
-        )
-        cores.append(ma | mb)
-    core3 = np.stack(cores, axis=0)
-    cz = float(sed.center_z)
-    mask3 = build_sediment_mask_3d(
-        core3,
-        center_col_px=sed.center_col_px,
-        center_z=cz,
-        radius_mm=sed.radius_mm,
-        spacing_xy_mm=state.spacing_mm,
-        spacing_z_mm=posed.z_mm,
-        erode_mm=sed.erode_mm,
-        nudge_x_mm=sed.nudge_x_mm,
-        nudge_z_mm=sed.nudge_z_mm,
-    )
-    sed.mask_3d = mask3
-    return mask3
-
-
-def _downcore_cache_key(state: StitchState) -> tuple | None:
-    if state.sediment is None:
-        return None
-    try:
-        posed = ensure_posed(state)
-    except Exception:
-        return None
-    sed = state.sediment
-    return (
-        id(posed.vol_a),
-        int(state.total_lag_px),
-        int(state.total_col_offset_px),
-        float(state.nudge_z_mm),
-        str(state.fuse_mode),
-        bool(state.match_hu),
-        float(sed.center_col_px),
-        float(sed.center_z),
-        float(sed.radius_mm),
-        float(sed.erode_mm),
-        float(sed.nudge_x_mm),
-        float(sed.nudge_z_mm),
-        bool(sed.mask_3d is not None),
-        bool(sed.exclude_low),
-        bool(sed.exclude_high),
-        None if sed.thr_lo_hu is None else round(float(sed.thr_lo_hu), 3),
-        None if sed.thr_hi_hu is None else round(float(sed.thr_hi_hu), 3),
-        str(sed.filter_method),
-    )
-
-
-def _cylinder_mask_at_z(
-    state: StitchState,
-    *,
-    z: int,
-    vol_b: np.ndarray,
-    mask_b: np.ndarray,
-    lag: int,
-    col: int,
-    posed: PosedVolumes,
-    h: int,
-    w: int,
-) -> tuple[np.ndarray, np.ndarray]:
-    """Return (fused HU, cylinder bool) for one Z on the stitch canvas."""
-    sed = state.sediment
-    assert sed is not None
-    ca, cb, ma, mb = compose_canvases(
-        posed.vol_a[z],
-        posed.mask_a[z],
-        vol_b[z],
-        mask_b[z],
-        lag,
-        col_offset_px=col,
-        cval=state.fixed.air,
-    )
-    feather = max(4.0, 12.0 * state.spacing_mm)
-    fused = fuse_preview(
-        ca,
-        cb,
-        ma,
-        mb,
-        opacity_a=1.0,
-        opacity_b=1.0,
-        mode=state.fuse_mode,
-        feather_mm=feather,
-        spacing_mm=state.spacing_mm,
-        match_hu=state.match_hu,
-    )
-    use_m3 = (
-        sed.mask_3d is not None
-        and sed.mask_3d.shape[0] == posed.n_slices
-        and sed.mask_3d.shape[1] == h
-        and sed.mask_3d.shape[2] == w
-    )
-    if use_m3:
-        sm = sed.mask_3d[z]  # type: ignore[index]
-    else:
-        sm = build_sediment_mask_2d(
-            ma | mb,
-            center_col_px=sed.center_col_px,
-            radius_mm=sed.radius_mm,
-            spacing_mm=state.spacing_mm,
-            erode_mm=sed.erode_mm,
-            nudge_x_mm=sed.nudge_x_mm,
-            view_z=float(z),
-            center_z=sed.center_z,
-            spacing_z_mm=posed.z_mm,
-            nudge_z_mm=sed.nudge_z_mm,
-        )
-    return fused, sm
-
-
-def compute_downcore_mean_hu(
-    state: StitchState,
-    *,
-    recompute_otsu: bool = False,
-) -> DowncoreProfile:
-    """
-    Mean HU along Y inside the sediment cylinder, averaged over Z (and X).
-
-    Optionally runs global multi-Otsu and excludes low/high classes from the mean.
-    """
-    if state.sediment is None:
-        raise ValueError("No sediment ROI — run Auto sediment first")
-    sed = state.sediment
-    posed, vol_b, mask_b = _posed_b_shifted(state)
-    lag = state.total_lag_px
-    col = state.total_col_offset_px
-
-    z0 = posed.n_slices // 2
-    ca0, _cb0, ma0, mb0 = compose_canvases(
-        posed.vol_a[z0],
-        posed.mask_a[z0],
-        vol_b[z0],
-        mask_b[z0],
-        lag,
-        col_offset_px=col,
-        cval=state.fixed.air,
-    )
-    h, w = ca0.shape
-    _ = (ma0, mb0)
-
-    want_filter = bool(sed.exclude_low or sed.exclude_high)
-    need_otsu = want_filter and (recompute_otsu or not sed.has_thresholds)
-    method = "mask_3d_stack" if sed.mask_3d is not None else "cylinder_chord_stack"
-
-    hist = np.zeros(HU_HIST_BINS, dtype=np.float64)
-    sum_raw = np.zeros(h, dtype=np.float64)
-    count_raw = np.zeros(h, dtype=np.float64)
-    sum_f = np.zeros(h, dtype=np.float64)
-    count_f = np.zeros(h, dtype=np.float64)
-    n_low = n_mid = n_high = 0
-
-    def _accum_slice(
-        fused: np.ndarray,
-        sm: np.ndarray,
-        *,
-        thr_lo: float | None,
-        thr_hi: float | None,
-        do_raw: bool,
-        do_filter: bool,
-        do_hist: bool,
-    ) -> None:
-        nonlocal n_low, n_mid, n_high
-        if do_raw:
-            _mean, cnt = mean_hu_per_row(fused, sm)
-            ok = cnt > 0
-            sum_raw[ok] += _mean[ok] * cnt[ok]
-            count_raw[ok] += cnt[ok]
-        if do_hist and sm.any():
-            hist[:] += np.histogram(
-                fused[sm], bins=HU_HIST_BINS, range=(HU_HIST_LO, HU_HIST_HI)
-            )[0]
-        if do_filter and thr_lo is not None and thr_hi is not None:
-            include, low, high = class_masks_from_hu(
-                fused,
-                sm,
-                thr_lo=float(thr_lo),
-                thr_hi=float(thr_hi),
-                exclude_low=sed.exclude_low,
-                exclude_high=sed.exclude_high,
-            )
-            n_low += int(low.sum())
-            n_high += int(high.sum())
-            n_mid += int((sm & ~low & ~high).sum())
-            _mf, cf = mean_hu_per_row(fused, include)
-            okf = cf > 0
-            sum_f[okf] += _mf[okf] * cf[okf]
-            count_f[okf] += cf[okf]
-
-    # Pass A: raw (+ hist if Otsu); filter in-pass when thresholds already known
-    for z in range(posed.n_slices):
-        fused, sm = _cylinder_mask_at_z(
-            state,
-            z=z,
-            vol_b=vol_b,
-            mask_b=mask_b,
-            lag=lag,
-            col=col,
-            posed=posed,
-            h=h,
-            w=w,
-        )
-        _accum_slice(
-            fused,
-            sm,
-            thr_lo=sed.thr_lo_hu if not need_otsu else None,
-            thr_hi=sed.thr_hi_hu if not need_otsu else None,
-            do_raw=True,
-            do_filter=want_filter and not need_otsu and sed.has_thresholds,
-            do_hist=need_otsu,
-        )
-
-    mean_raw = np.full(h, np.nan, dtype=np.float64)
-    ok_r = count_raw > 0
-    mean_raw[ok_r] = sum_raw[ok_r] / count_raw[ok_r]
-
-    if need_otsu:
-        t0, t1 = multi_otsu_two_thresholds(hist)
-        sed.thr_lo_hu = t0
-        sed.thr_hi_hu = t1
-        sed.filter_method = "otsu3"
-        # Pass B: filtered means only (raw already done)
-        sum_f[:] = 0.0
-        count_f[:] = 0.0
-        n_low = n_mid = n_high = 0
-        for z in range(posed.n_slices):
-            fused, sm = _cylinder_mask_at_z(
-                state,
-                z=z,
-                vol_b=vol_b,
-                mask_b=mask_b,
-                lag=lag,
-                col=col,
-                posed=posed,
-                h=h,
-                w=w,
-            )
-            _accum_slice(
-                fused,
-                sm,
-                thr_lo=t0,
-                thr_hi=t1,
-                do_raw=False,
-                do_filter=True,
-                do_hist=False,
-            )
-    elif sed.filter_method == "none" and sed.has_thresholds:
-        sed.filter_method = "manual"
-
-    thr_lo = sed.thr_lo_hu
-    thr_hi = sed.thr_hi_hu
-    use_filter = want_filter and thr_lo is not None and thr_hi is not None
-
-    if use_filter:
-        method = method + "+hu_filter"
-        mean_f = np.full(h, np.nan, dtype=np.float64)
-        ok_f = count_f > 0
-        mean_f[ok_f] = sum_f[ok_f] / count_f[ok_f]
-        total = max(n_low + n_mid + n_high, 1)
-        sed.frac_low = n_low / total
-        sed.frac_high = n_high / total
-        sed.frac_mid = n_mid / total
-        excl = 0.0
-        if sed.exclude_low:
-            excl += float(sed.frac_low)
-        if sed.exclude_high:
-            excl += float(sed.frac_high)
-        rebuild_sediment_mask_2d(state)
-        return DowncoreProfile(
-            mean_hu=mean_f,
-            count=count_f.astype(np.int64),
-            spacing_mm=state.spacing_mm,
-            method=method,
-            mean_hu_raw=mean_raw,
-            count_raw=count_raw.astype(np.int64),
-            thr_lo_hu=float(thr_lo),
-            thr_hi_hu=float(thr_hi),
-            frac_excluded=float(excl),
-        )
-
-    sed.frac_low = sed.frac_high = sed.frac_mid = None
-    rebuild_sediment_mask_2d(state)
-    return DowncoreProfile(
-        mean_hu=mean_raw,
-        count=count_raw.astype(np.int64),
-        spacing_mm=state.spacing_mm,
-        method=method,
-        mean_hu_raw=None,
-        count_raw=None,
-        thr_lo_hu=thr_lo,
-        thr_hi_hu=thr_hi,
-        frac_excluded=0.0,
-    )
-
-
-def ensure_downcore_profile(
-    state: StitchState,
-    *,
-    recompute_otsu: bool = False,
-) -> DowncoreProfile:
-    """Return cached downcore profile, recomputing when pose/ROI/filter changes."""
-    if recompute_otsu and state.sediment is not None:
-        state.sediment.thr_lo_hu = None
-        state.sediment.thr_hi_hu = None
-        state.sediment.filter_method = "none"
-        state._downcore_cache_key = None
-        state._downcore_profile = None
-    key = _downcore_cache_key(state)
-    if key is None:
-        raise ValueError("No sediment ROI — run Auto sediment first")
-    if (
-        not recompute_otsu
-        and state._downcore_profile is not None
-        and state._downcore_cache_key == key
-    ):
-        return state._downcore_profile
-    prof = compute_downcore_mean_hu(state, recompute_otsu=recompute_otsu)
-    state._downcore_profile = prof
-    state._downcore_cache_key = _downcore_cache_key(state)
-    return prof
-
-
 def preview_arrays(
     state: StitchState,
     *,
@@ -942,16 +465,11 @@ def preview_arrays(
     opacity_b: float = 0.7,
     crop_core: bool = False,
     pad_mm: float = 3.0,
-    overlay_sediment: bool | None = None,
-    downcore_plot: bool | None = None,
-    plot_width: int = 160,
 ) -> np.ndarray:
     """Return HxW uint8 or HxWx3 uint8 for display / JPEG / 8-bit TIFF."""
     assert state.canvas_a is not None
     assert state.mask_a is not None and state.mask_b is not None
     lo, hi = window_limits(state)
-    show_sed = state.show_sediment if overlay_sediment is None else overlay_sediment
-    show_plot = state.show_downcore_plot if downcore_plot is None else downcore_plot
     if align_mode:
         out = alignment_rgb(
             state.canvas_a,
@@ -970,226 +488,11 @@ def preview_arrays(
         u8 = np.clip((fused - lo) / (hi - lo) * 255.0, 0, 255).astype(np.uint8)
         union = state.mask_a | state.mask_b
         out = np.where(union, u8, 0).astype(np.uint8)
-    if show_sed and state.sediment is not None:
-        sed = state.sediment
-        if (
-            sed.has_thresholds
-            and sed.mask_include_2d is not None
-            and sed.mask_include_2d.any()
-        ):
-            out = overlay_sediment_classes_rgb(
-                out,
-                include=sed.mask_include_2d,
-                low=sed.mask_low_2d,
-                high=sed.mask_high_2d,
-                show_low=sed.exclude_low,
-                show_high=sed.exclude_high,
-            )
-        elif sed.mask_2d is not None and sed.mask_2d.any():
-            out = overlay_sediment_rgb(out, sed.mask_2d)
 
-    box = (0, out.shape[0], 0, out.shape[1])
     if crop_core:
         pad_px = max(2, int(round(pad_mm / max(state.spacing_mm, 1e-6))))
         box = core_crop_box(state.mask_a, state.mask_b, pad_px=pad_px)
         out = crop_to_box(out, box)
-
-    # Plot only if already cached — never compute here (keeps GUI paint responsive)
-    if show_plot and state.sediment is not None and state.canvas_a is not None:
-        key = _downcore_cache_key(state)
-        prof = state._downcore_profile
-        if (
-            prof is not None
-            and key is not None
-            and state._downcore_cache_key == key
-            and prof.n_rows == state.canvas_a.shape[0]
-        ):
-            r0, r1, _c0, _c1 = box
-            if out.ndim == 2:
-                out = np.stack([out, out, out], axis=-1)
-            strip = render_downcore_plot_rgb(
-                prof, row0=r0, row1=r1, width=plot_width
-            )
-            if strip.shape[0] == out.shape[0]:
-                sep = np.full((out.shape[0], 3, 3), 40, dtype=np.uint8)
-                out = np.concatenate([out, sep, strip], axis=1)
-    return out
-
-
-def _posed_b_shifted(
-    state: StitchState,
-) -> tuple[PosedVolumes, np.ndarray, np.ndarray]:
-    posed = ensure_posed(state)
-    vol_b, mask_b = posed.vol_b, posed.mask_b
-    dz_px = int(round(state.nudge_z_mm / max(posed.z_mm, 1e-6)))
-    if dz_px != 0:
-        vol_b, mask_b = _shift_stack_z(
-            vol_b, mask_b, dz_px, cval=state.mobile_base.air
-        )
-    return posed, vol_b, mask_b
-
-
-def default_xz_y_row(state: StitchState, frac: float = 0.5) -> int | None:
-    """
-    Y (row) along upright core for XZ cut; frac in [0,1] within core span.
-
-    Uses a mid-Z posed compose (not the coronal canvas) so the cut matches the
-    volume geometry used to build the XZ plane.
-    """
-    try:
-        posed, vol_b, mask_b = _posed_b_shifted(state)
-    except Exception:
-        return None
-    z = posed.n_slices // 2
-    _ca, _cb, ma, mb = compose_canvases(
-        posed.vol_a[z],
-        posed.mask_a[z],
-        vol_b[z],
-        mask_b[z],
-        state.total_lag_px,
-        col_offset_px=state.total_col_offset_px,
-        cval=state.fixed.air,
-    )
-    union = ma | mb
-    rows = np.where(union.any(axis=1))[0]
-    if rows.size == 0:
-        return union.shape[0] // 2
-    r0, r1 = int(rows[0]), int(rows[-1])
-    t = float(np.clip(frac, 0.0, 1.0))
-    return int(round(r0 + t * (r1 - r0)))
-
-
-def _build_fused_xz_plane(
-    state: StitchState, y_row: int
-) -> tuple[np.ndarray, np.ndarray]:
-    """Fuse every Z at fixed canvas row → HU + core mask shaped (Z, W)."""
-    posed, vol_b, mask_b = _posed_b_shifted(state)
-    lag = state.total_lag_px
-    col = state.total_col_offset_px
-    feather = max(4.0, 12.0 * state.spacing_mm)
-    hu_rows: list[np.ndarray] = []
-    m_rows: list[np.ndarray] = []
-    for z in range(posed.n_slices):
-        ca, cb, ma, mb = compose_canvases(
-            posed.vol_a[z],
-            posed.mask_a[z],
-            vol_b[z],
-            mask_b[z],
-            lag,
-            col_offset_px=col,
-            cval=state.fixed.air,
-        )
-        y = int(np.clip(y_row, 0, ca.shape[0] - 1))
-        # 1-row fuse (same modes as coronal)
-        fused = fuse_preview(
-            ca[y : y + 1],
-            cb[y : y + 1],
-            ma[y : y + 1],
-            mb[y : y + 1],
-            opacity_a=1.0,
-            opacity_b=1.0,
-            mode=state.fuse_mode,
-            feather_mm=feather,
-            spacing_mm=state.spacing_mm,
-            match_hu=state.match_hu,
-        )
-        hu_rows.append(fused[0].astype(np.float32))
-        m_rows.append((ma[y] | mb[y]))
-    return np.stack(hu_rows, axis=0), np.stack(m_rows, axis=0)
-
-
-def preview_xz_arrays(
-    state: StitchState,
-    *,
-    y_frac: float = 0.5,
-    overlay_sediment: bool | None = None,
-    crop_core: bool = True,
-    pad_mm: float = 3.0,
-) -> np.ndarray | None:
-    """
-    Compact XZ QC image (rows=Z, cols=X), isotropic mm display.
-
-    Returns RGB uint8, or None if posed stack not ready.
-    Yellow line = current coronal Z; green ellipse = sediment cylinder.
-    """
-    try:
-        posed = ensure_posed(state)
-    except Exception:
-        return None
-    y_row = default_xz_y_row(state, y_frac)
-    if y_row is None:
-        return None
-
-    key = (
-        id(posed.vol_a),
-        int(state.total_lag_px),
-        int(state.total_col_offset_px),
-        float(state.nudge_z_mm),
-        str(state.fuse_mode),
-        bool(state.match_hu),
-        int(y_row),
-    )
-    if state._xz_cache_key != key or state._xz_hu is None or state._xz_mask is None:
-        state._xz_hu, state._xz_mask = _build_fused_xz_plane(state, y_row)
-        state._xz_cache_key = key
-
-    hu = state._xz_hu
-    msk = state._xz_mask
-    lo, hi = window_limits(state)
-    if hi <= lo:
-        hi = lo + 1.0
-    u8 = np.clip((hu - lo) / (hi - lo) * 255.0, 0, 255).astype(np.uint8)
-    # Show something even outside mask (dim) so the panel never looks "empty"
-    u8_out = np.where(msk, u8, (u8.astype(np.float32) * 0.15).astype(np.uint8))
-
-    # Crop X to core columns (keep full Z)
-    c0, c1 = 0, u8_out.shape[1]
-    if crop_core and msk.any():
-        cols = np.where(msk.any(axis=0))[0]
-        if cols.size:
-            pad_px = max(2, int(round(pad_mm / max(state.spacing_mm, 1e-6))))
-            c0 = max(0, int(cols[0]) - pad_px)
-            c1 = min(u8_out.shape[1], int(cols[-1]) + 1 + pad_px)
-            u8_out = u8_out[:, c0:c1]
-            msk = msk[:, c0:c1]
-
-    show_sed = state.show_sediment if overlay_sediment is None else overlay_sediment
-    view_z = float(state.view_z) if state.view_z is not None else float(posed.n_slices // 2)
-
-    if show_sed and state.sediment is not None:
-        sed = state.sediment
-        r_mm = sed.effective_radius_mm
-        cx = sed.center_col_px + sed.nudge_x_mm / max(state.spacing_mm, 1e-6) - c0
-        cz = sed.center_z + sed.nudge_z_mm / max(posed.z_mm, 1e-6)
-        out = overlay_sediment_circle_xz(
-            u8_out,
-            center_x_px=cx,
-            center_z_px=cz,
-            radius_x_px=r_mm / max(state.spacing_mm, 1e-6),
-            radius_z_px=r_mm / max(posed.z_mm, 1e-6),
-            view_z_px=view_z,
-        )
-    else:
-        out = np.stack([u8_out, u8_out, u8_out], axis=-1)
-        if 0 <= view_z < out.shape[0]:
-            out[int(round(view_z)), :] = (255, 220, 60)
-
-    # Isotropic display: scale Z so 1 px ≈ spacing_xy mm
-    # (per-channel resize — avoids skimage channel_axis / multichannel API drift)
-    z_scale = float(posed.z_mm) / max(state.spacing_mm, 1e-6)
-    if abs(z_scale - 1.0) > 0.05 and out.shape[0] > 1:
-        new_h = max(1, int(round(out.shape[0] * z_scale)))
-        chans = [
-            resize(
-                out[:, :, i].astype(np.float32),
-                (new_h, out.shape[1]),
-                order=1,
-                preserve_range=True,
-                anti_aliasing=True,
-            )
-            for i in range(out.shape[2])
-        ]
-        out = np.clip(np.stack(chans, axis=-1), 0, 255).astype(np.uint8)
     return out
 
 
@@ -1505,37 +808,6 @@ def sidecar_dict(state: StitchState) -> dict:
             "score_before": ref.score_before,
             "method": ref.method,
             "shift_px_zyx": list(ref.shift_px),
-        },
-        "sediment": None
-        if state.sediment is None
-        else {
-            "center_col_px": state.sediment.center_col_px,
-            "center_z": state.sediment.center_z,
-            "radius_mm": state.sediment.radius_mm,
-            "erode_mm": state.sediment.erode_mm,
-            "effective_radius_mm": state.sediment.effective_radius_mm,
-            "nudge_x_mm": state.sediment.nudge_x_mm,
-            "nudge_z_mm": state.sediment.nudge_z_mm,
-            "liner_od_mm": state.sediment.liner_od_mm,
-            "liner_wall_mm": state.sediment.liner_wall_mm,
-            "liner_hu": state.sediment.liner_hu,
-            "void_hu": state.sediment.void_hu,
-            "method": state.sediment.method,
-            "note": state.sediment.note,
-            "thr_lo_hu": state.sediment.thr_lo_hu,
-            "thr_hi_hu": state.sediment.thr_hi_hu,
-            "exclude_low": state.sediment.exclude_low,
-            "exclude_high": state.sediment.exclude_high,
-            "filter_method": state.sediment.filter_method,
-            "frac_low": state.sediment.frac_low,
-            "frac_mid": state.sediment.frac_mid,
-            "frac_high": state.sediment.frac_high,
-            "has_mask_2d": bool(
-                state.sediment.mask_2d is not None and state.sediment.mask_2d.any()
-            ),
-            "has_mask_3d": bool(
-                state.sediment.mask_3d is not None and state.sediment.mask_3d.any()
-            ),
         },
         "warnings": list(state.warnings),
     }
