@@ -18,6 +18,7 @@ dependencies = [
     "pylibjpeg-rle>=2.0",
     "scikit-image>=0.22",
     "scipy>=1.11",
+    "SimpleITK>=2.3",
 ]
 
 [project.scripts]

@@ -15,3 +15,6 @@ build/
 tmp_*/
 *.dcm
 dicom_mpr/
+
+# survey / comparison results
+out/
