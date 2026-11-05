@@ -87,6 +87,7 @@ class Plan:
     same_lattice: bool
     snapped: bool
     snap_residual_mm: float
+    snap_vec: np.ndarray  # physical vector the whole-pixel snap added to the shift (zero if none)
     lo: np.ndarray  # first output index, in reference-lattice units
     size: list[int]  # output size (x, y, z)
     crop_pad_mm: float | None
@@ -171,12 +172,14 @@ def plan_stitch(
     same = _same_lattice(ref, mov)
     snapped = False
     snap_residual_mm = 0.0
+    snap_vec = np.zeros(3)
     if same and placement == "whole_pixel":
         c = np.asarray(rimg.TransformPhysicalPointToContinuousIndex(tuple(np.asarray(mimg.GetOrigin()) + move)))
         r = np.round(c)
         p0 = np.asarray(rimg.TransformContinuousIndexToPhysicalPoint(tuple(c)))
         p1 = np.asarray(rimg.TransformContinuousIndexToPhysicalPoint(tuple(r)))
         snap_residual_mm = float(np.linalg.norm(p1 - p0))
+        snap_vec = p1 - p0
         move = move + (p1 - p0)
         snapped = True
 
@@ -200,7 +203,7 @@ def plan_stitch(
     size = (hi - lo + 1).tolist()
     return Plan(top=top, bottom=bottom, ref=ref, mov=mov, move=move, move_mm_bottom=tuple(float(x) for x in move_mm),
                 placement=placement, same_lattice=bool(same), snapped=bool(snapped), snap_residual_mm=snap_residual_mm,
-                lo=lo, size=size, crop_pad_mm=crop_pad_mm)
+                snap_vec=snap_vec, lo=lo, size=size, crop_pad_mm=crop_pad_mm)
 
 
 def render_plan(
@@ -346,3 +349,125 @@ def image_based_move_mm(
     img_along = st.total_lag_px * mm
     img_across = (st.mobile_base.lateral_dcol + st.total_col_offset_px) * mm
     return (float(img_along - np.dot(delta, col)), float(img_across - np.dot(delta, row)), 0.0)
+
+
+@dataclass
+class RefineOutcome:
+    """Result of ``refine_translation``; shifts are for the BOTTOM half, in mm."""
+
+    along_mm: float
+    across_mm: float
+    score_before: float  # correlation over the overlap core, before / after
+    score_after: float
+    applied: bool
+    note: str
+    iterations: int = 0
+
+
+def _local(img: sitk.Image, direction: np.ndarray, origin: np.ndarray) -> sitk.Image:
+    """Same voxels, re-expressed in the reference frame: axes = (across, along, depth), identity direction.
+
+    A translation found in this frame is directly (across, along, depth) in mm, whatever the scan's tilt.
+    """
+    out = sitk.Image(img)
+    out.SetDirection((1.0, 0, 0, 0, 1.0, 0, 0, 0, 1.0))
+    out.SetOrigin(tuple(float(x) for x in direction.T @ (np.asarray(img.GetOrigin()) - origin)))
+    return out
+
+
+def refine_translation(
+    plan: Plan,
+    *,
+    max_shift_mm: float = 15.0,
+    slab: int = 24,
+    margin_rows: int = 20,
+    edge_rows: int = 4,
+) -> RefineOutcome:
+    """Fine-tune the bottom half's position by intensity registration (SimpleITK).
+
+    A rigid translation along and across the core (depth is left alone) that maximises the
+    correlation of the two halves over the overlap core, starting from the current placement.
+    Metric: correlation (insensitive to overall brightness differences); linear interpolation;
+    two resolution levels; regular-step gradient descent.  The shift is applied only if it improves
+    the score and is no larger than ``max_shift_mm``.
+    """
+    mid = plan.n_slices // 2
+    z0 = max(0, mid - slab // 2)
+    z1 = min(plan.n_slices - 1, z0 + slab - 1)
+    res = render_plan(plan, trim_rows=0, z_keep=(z0, z1))
+    both = res.ref_core & res.mov_core & res.ref_footprint & res.mov_footprint
+    rows = np.where(both.any(axis=(0, 2)))[0]
+    if rows.size < 2 * edge_rows + 8:
+        return RefineOutcome(0.0, 0.0, float("nan"), float("nan"), False, "The halves barely overlap, so there is nothing to refine on.")
+    r0 = max(int(rows.min()) - margin_rows, 0)
+    r1 = min(int(rows.max()) + margin_rows + 1, both.shape[1])
+    mask = binary_erosion(both[:, r0:r1, :], np.ones((1, 2 * edge_rows + 1, 1), bool))
+    if mask.sum() < 500:
+        return RefineOutcome(0.0, 0.0, float("nan"), float("nan"), False, "Too little overlap core to register on.")
+
+    direction = np.column_stack([plan.ref.row_dir, plan.ref.col_dir, plan.ref.normal])
+    o_ref = np.asarray(res.grid.GetOrigin())
+    fixed = sitk.GetImageFromArray(np.ascontiguousarray(res.ref_vol[:, r0:r1, :], dtype=np.float32))
+    fixed.SetSpacing(res.grid.GetSpacing())
+    fixed.SetDirection(res.grid.GetDirection())
+    fixed.SetOrigin(res.grid.TransformIndexToPhysicalPoint((0, r0, 0)))
+    m = sitk.GetImageFromArray(mask.astype(np.uint8))
+    m.CopyInformation(fixed)
+    moving = sitk.Image(plan.mov.image)
+    moving.SetOrigin(tuple(float(x) for x in np.asarray(moving.GetOrigin()) + plan.move))  # current placement baked in
+
+    fixed_l, mask_l = _local(fixed, direction, o_ref), _local(m, direction, o_ref)
+    moving_l = _local(moving, direction, o_ref)
+
+    reg = sitk.ImageRegistrationMethod()
+    reg.SetMetricAsCorrelation()
+    reg.SetMetricFixedMask(mask_l)
+    reg.SetMetricSamplingStrategy(reg.REGULAR)
+    reg.SetMetricSamplingPercentage(0.3, 1)
+    reg.SetInterpolator(sitk.sitkLinear)
+    reg.SetOptimizerAsRegularStepGradientDescent(
+        learningRate=2.0, minStep=1e-3, numberOfIterations=120, relaxationFactor=0.5, gradientMagnitudeTolerance=1e-7
+    )
+    reg.SetOptimizerScalesFromPhysicalShift()
+    reg.SetOptimizerWeights([1.0, 1.0, 0.0])  # across, along; depth stays where you put it
+    reg.SetShrinkFactorsPerLevel([2, 1])
+    reg.SetSmoothingSigmasPerLevel([1.0, 0.0])
+    reg.SmoothingSigmasAreSpecifiedInPhysicalUnitsOn()
+    start = sitk.TranslationTransform(3)
+    reg.SetInitialTransform(start, inPlace=False)
+    tx = reg.Execute(fixed_l, moving_l)
+
+    # Score both positions the same way: full resolution, the same pixels, and only pixels that
+    # lie inside the moving image at BOTH positions (so a shift cannot be penalised by air at an edge).
+    fixed_arr = sitk.GetArrayFromImage(fixed_l)
+    mask_arr = sitk.GetArrayFromImage(mask_l) > 0
+    ones = sitk.Image(moving_l.GetSize(), sitk.sitkUInt8) + 1
+    ones.CopyInformation(moving_l)
+
+    def placed(offset):
+        t = sitk.TranslationTransform(3, tuple(float(x) for x in offset))
+        r = sitk.Resample(moving_l, fixed_l, t, sitk.sitkLinear, float(plan.ref.air), sitk.sitkFloat32)
+        v = sitk.Resample(ones, fixed_l, t, sitk.sitkNearestNeighbor, 0, sitk.sitkUInt8)
+        return sitk.GetArrayFromImage(r), sitk.GetArrayFromImage(v) > 0
+
+    def ncc(a, b, m) -> float:
+        a, b = a[m].astype(np.float64), b[m].astype(np.float64)
+        a = (a - a.mean()) / (a.std() + 1e-9)
+        b = (b - b.mean()) / (b.std() + 1e-9)
+        return float((a * b).mean())
+
+    o = np.asarray(tx.GetParameters(), float)  # fixed point p corresponds to moving point p + o
+    (m0, v0), (m1, v1) = placed((0.0, 0.0, 0.0)), placed(o)
+    common = mask_arr & v0 & v1
+    before, after = ncc(fixed_arr, m0, common), ncc(fixed_arr, m1, common)
+    content = -o  # so the moving half's content must move by -o  (across, along, depth)
+    sign = 1.0 if plan.mov is plan.bottom else -1.0
+    along, across = float(sign * content[1]), float(sign * content[0])
+    iters = int(reg.GetOptimizerIteration())
+    if max(abs(along), abs(across)) > max_shift_mm:
+        return RefineOutcome(0.0, 0.0, before, after, False,
+                             f"Refine wanted to move the bottom half {along:+.1f} mm along / {across:+.1f} mm across, "
+                             f"more than the {max_shift_mm:.0f} mm limit, so nothing was changed.", iters)
+    if not (after > before + 1e-4):
+        return RefineOutcome(0.0, 0.0, before, after, False, "Refine found no better position; nothing was changed.", iters)
+    return RefineOutcome(along, across, before, after, True, "", iters)

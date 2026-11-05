@@ -75,6 +75,12 @@ Align tab. A banner says whether the scanner placement agrees with the images. I
 export. If not, shift the bottom half by hand (arrow keys or the three boxes), or press **Re-align from image**,
 which runs the older core-mask + profile alignment and starts from its answer.
 
+**Refine join** fine-tunes the bottom half's position by SimpleITK registration (a translation along and across the
+core that maximises the correlation of the two halves over the overlap). It is applied only if it improves the
+join, and the Align tab says what it costs in resampling for the loaded pair: nothing extra when the bottom/top half is
+already being resampled to the finer pixel size, a rounding to the nearest pixel when both halves share a pixel size
+and whole-pixel placement is on, and one interpolation when it is off.
+
 The half with the finer pixels is kept exactly as scanned; the other half is resampled once onto its grid.
 Tick or untick **Whole-pixel placement** to choose between keeping every voxel original (when both halves share a
 pixel size) and sub-pixel placement. The older mask-based workflow is still there ("Use scanner geometry" box).

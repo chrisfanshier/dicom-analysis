@@ -79,7 +79,8 @@ def write_dicom(folder: Path, uid: str, vol: np.ndarray, origin, px: float, dz: 
 class Rig:
     """Two overlapping halves of the phantom written to disk."""
 
-    def __init__(self, tmp: Path, px_top=0.5, px_btm=0.4, btm_offset=(0.0, 0.0, 0.0), btm_header_error_z=0.0):
+    def __init__(self, tmp: Path, px_top=0.5, px_btm=0.4, btm_offset=(0.0, 0.0, 0.0), btm_header_error_z=0.0,
+                 btm_header_error_x=0.0):
         self.dz = 2.0
         self.nz = 16
         self.top_origin = (-45.0, -15.0, 100.0)
@@ -90,7 +91,7 @@ class Rig:
         *_, self.top = sample(self.top_origin, px_top, nx_top, n_top, self.nz, self.dz)
         # bottom data come from the true phantom at its true origin; the *header* may be wrong
         *_, self.btm = sample(self.btm_origin, px_btm, nx_btm, n_btm, self.nz, self.dz)
-        hdr_btm = (self.btm_origin[0], self.btm_origin[1], self.btm_origin[2] + btm_header_error_z)
+        hdr_btm = (self.btm_origin[0] + btm_header_error_x, self.btm_origin[1], self.btm_origin[2] + btm_header_error_z)
         self.px_top, self.px_btm = px_top, px_btm
         self.top_dir, self.btm_dir = tmp / "top", tmp / "btm"
         write_dicom(self.top_dir, "1.2.3.4", self.top, self.top_origin, px_top, self.dz)

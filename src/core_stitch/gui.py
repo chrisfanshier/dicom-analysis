@@ -65,6 +65,8 @@ class StitchGui(tk.Tk):
         self.hdr_whole_pixel = tk.BooleanVar(value=True)
         self.hdr_info = tk.StringVar(value="")
         self.hdr_check = tk.StringVar(value="")
+        self.hdr_refine_note = tk.StringVar(value="")
+        self.hdr_refine_result = tk.StringVar(value="")
         self._hdr_job: str | None = None
         self._scale = 1.0  # canvas px per image px
         self._fit = 1.0
@@ -284,6 +286,9 @@ class StitchGui(tk.Tk):
             "placement, which interpolates the bottom half.",
             wraplength=320, font=("", 8),
         ).pack(anchor=tk.W)
+        ttk.Button(parent, text="Refine join", command=self._hdr_refine).pack(fill=tk.X, pady=(10, 0))
+        ttk.Label(parent, textvariable=self.hdr_refine_note, wraplength=320, font=("", 8)).pack(anchor=tk.W)
+        ttk.Label(parent, textvariable=self.hdr_refine_result, wraplength=320, font=("", 9, "bold")).pack(anchor=tk.W, pady=(2, 0))
         ttk.Button(parent, text="Re-align from image (mask + profile)", command=self._hdr_realign).pack(
             fill=tk.X, pady=(10, 0)
         )
@@ -651,6 +656,7 @@ class StitchGui(tk.Tk):
         self.hdr_across.set(round(st.move_mm[1], 3))
         self.hdr_depth.set(round(st.move_mm[2], 3))
         self.hdr_info.set(st.summary())
+        self.hdr_refine_note.set(st.refine_note())
         text, ok = st.check_text()
         self.hdr_check.set(text)
         self._hdr_check_label.configure(foreground="#15803d" if ok else "#b45309")
@@ -669,10 +675,14 @@ class StitchGui(tk.Tk):
             a, b, d = float(self.hdr_along.get()), float(self.hdr_across.get()), float(self.hdr_depth.get())
         except (TypeError, ValueError, tk.TclError):
             return
+        placement = "whole_pixel" if self.hdr_whole_pixel.get() else "subpixel"
+        if placement == st.placement and all(abs(x - y) < 1e-6 for x, y in zip((a, b, d), st.move_mm)):
+            return  # nothing changed (e.g. focus left a box without an edit)
         self.status.set("Re-placing the bottom half...")
         self.update_idletasks()
+        self.hdr_refine_result.set("")
         try:
-            st.placement = "whole_pixel" if self.hdr_whole_pixel.get() else "subpixel"
+            st.placement = placement
             moved = any(abs(x) > 1e-9 for x in (a, b, d))
             st.set_move(a, b, d, source=None if moved else "scanner header")
         except Exception as exc:
@@ -687,9 +697,35 @@ class StitchGui(tk.Tk):
     def _hdr_reset(self) -> None:
         if not self._hdr_active():
             return
+        self.hdr_refine_result.set("")
         self.single.set_move(0.0, 0.0, 0.0, source="scanner header")
         self._hdr_sync()
         self._sync_single_controls()
+        self._schedule_refresh()
+
+    def _hdr_refine(self) -> None:
+        if not self._hdr_active():
+            messagebox.showinfo("Refine join", "Load a pair first.")
+            return
+        self.status.set("Refining the join (registration over the overlap, several seconds)...")
+        self.update_idletasks()
+        try:
+            out = self.single.refine()
+        except Exception as exc:
+            messagebox.showerror("Refine failed", str(exc))
+            self.status.set(f"Refine failed: {exc}")
+            return
+        self._hdr_sync()
+        self._sync_single_controls()
+        if out.applied:
+            self.hdr_refine_result.set(
+                f"Refined: bottom half moved {out.along_mm:+.2f} mm along, {out.across_mm:+.2f} mm across; "
+                f"join correlation as placed {out.score_before:.4f} -> {out.score_after:.4f}."
+            )
+            self.status.set("Refined. Check the join, then Export.")
+        else:
+            self.hdr_refine_result.set(out.note + (f" (correlation {out.score_before:.4f}.)" if out.score_before == out.score_before else ""))
+            self.status.set("Refine made no change.")
         self._schedule_refresh()
 
     def _hdr_realign(self) -> None:

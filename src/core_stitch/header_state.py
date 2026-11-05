@@ -14,6 +14,7 @@ from pathlib import Path
 
 import numpy as np
 import pydicom
+from scipy.ndimage import binary_erosion
 import SimpleITK as sitk
 from PIL import Image
 from pydicom.dataset import FileDataset, FileMetaDataset
@@ -21,7 +22,16 @@ from pydicom.uid import ExplicitVRLittleEndian, generate_uid
 
 from core_stitch.header_check import header_check
 from core_stitch.overlap import alignment_rgb
-from core_stitch.itk_stitch import Half, ItkStitch, image_based_move_mm, load_half, plan_stitch, render_plan
+from core_stitch.itk_stitch import (
+    Half,
+    ItkStitch,
+    RefineOutcome,
+    image_based_move_mm,
+    load_half,
+    plan_stitch,
+    refine_translation,
+    render_plan,
+)
 from core_stitch.pipeline import core_crop_box, crop_to_box
 from core_stitch.scale import auto_bounds, core_scale_block, dpi_for
 
@@ -38,6 +48,7 @@ class HeaderState:
         self.placement = placement
         self.move_mm = [0.0, 0.0, 0.0]  # bottom half, from its header position: along, across, depth
         self.moved_by = "scanner header"  # or "image alignment" after Re-align
+        self.refine_info: dict | None = None  # set by refine(); cleared when the shift is changed by hand
         self.window_lo: float | None = None
         self.window_hi: float | None = None
         self.warnings: list[str] = []
@@ -59,10 +70,12 @@ class HeaderState:
     def _render(self) -> None:
         self.res: ItkStitch = render_plan(self.plan, trim_rows=TRIM_ROWS, z_keep=(self.frame, self.frame))
 
-    def set_move(self, along: float, across: float, depth: float, *, source: str | None = None) -> None:
+    def set_move(self, along: float, across: float, depth: float, *, source: str | None = None, keep_refine: bool = False) -> None:
         self.move_mm = [float(along), float(across), float(depth)]
         if source:
             self.moved_by = source
+        if not keep_refine:
+            self.refine_info = None
         self._replan()
         self.frame = int(np.clip(self.frame, 0, self.plan.n_slices - 1))
         self._render()
@@ -71,6 +84,77 @@ class HeaderState:
         if placement != self.placement:
             self.placement = placement
             self.set_move(*self.move_mm)
+
+    def join_correlation(self) -> float:
+        """Correlation of the two halves, as placed, over the overlap core of the current slice."""
+        r = self.res
+        m = r.ref_core[0] & r.mov_core[0] & r.ref_footprint[0] & r.mov_footprint[0]
+        m = binary_erosion(m, np.ones((9, 1), bool))  # stay off the halves' edge rows
+        if m.sum() < 200:
+            return float("nan")
+        return float(np.corrcoef(r.ref_vol[0][m].astype(np.float64), r.mov_vol[0][m].astype(np.float64))[0, 1])
+
+    def refine(self) -> RefineOutcome:
+        """Fine-tune the position by SimpleITK registration (translation along and across the core).
+
+        The registration finds an exact (sub-pixel) optimum.  It is applied from the position the
+        halves are *really* at: any whole-pixel rounding already in the placement is folded into the
+        shift first, so the optimum is rounded once, not twice.
+        """
+        out = refine_translation(self.plan)
+        if not out.applied:
+            return out
+        before_move, before_by, before_info = list(self.move_mm), self.moved_by, self.refine_info
+        before_corr = self.join_correlation()
+        p = self.plan
+        sign = 1.0 if p.mov is p.bottom else -1.0
+        v = p.snap_vec
+        fold = [sign * float(np.dot(v, p.ref.col_dir)), sign * float(np.dot(v, p.ref.row_dir)), sign * float(np.dot(v, p.ref.normal))]
+        a, b, d = (self.move_mm[i] + fold[i] for i in range(3))
+        placed_before = p.move.copy()
+        self.set_move(a + out.along_mm, b + out.across_mm, d, source=None, keep_refine=True)
+        if self.plan.snapped and np.allclose(self.plan.move, placed_before, atol=1e-6):
+            # the refined optimum rounds to the pixel the halves are already on
+            self.set_move(*before_move, source=before_by, keep_refine=True)
+            self.refine_info = before_info
+            return RefineOutcome(0.0, 0.0, before_corr, before_corr, False,
+                                 f"Refine's best position ({out.along_mm:+.2f} mm along, {out.across_mm:+.2f} mm across) rounds to the pixel the "
+                                 "halves are already on, so nothing changed. Untick whole-pixel placement to use the sub-pixel position.",
+                                 out.iterations)
+        after_corr = self.join_correlation()
+        if np.isfinite(before_corr) and np.isfinite(after_corr) and after_corr < before_corr - 0.002:
+            # rounding to a whole pixel cannot honour this optimum: keep what was there
+            self.set_move(*before_move, source=before_by, keep_refine=True)
+            self.refine_info = before_info
+            return RefineOutcome(0.0, 0.0, before_corr, after_corr, False,
+                                 "Refine's best position is a fraction of a pixel and whole-pixel placement can't hold it "
+                                 f"(it would lower the join correlation from {before_corr:.4f} to {after_corr:.4f}), so nothing "
+                                 "was changed. Untick whole-pixel placement to use the sub-pixel position.", out.iterations)
+        if not self.moved_by.endswith("+ refine"):
+            self.moved_by += " + refine"
+        self.refine_info = {
+            "method": "SimpleITK translation registration, correlation metric, linear interpolation, 2 levels",
+            "shift_mm": {"along_core": out.along_mm, "across_core": out.across_mm},
+            "optimum_correlation_before": None if not np.isfinite(out.score_before) else round(out.score_before, 4),
+            "optimum_correlation_after": round(out.score_after, 4),
+            "join_correlation_as_placed_before": None if not np.isfinite(before_corr) else round(before_corr, 4),
+            "join_correlation_as_placed_after": None if not np.isfinite(after_corr) else round(after_corr, 4),
+            "iterations": out.iterations,
+        }
+        return RefineOutcome(out.along_mm, out.across_mm, before_corr, after_corr, True, "", out.iterations)
+
+    def refine_note(self) -> str:
+        """What a refined shift will cost in resampling, for this pair, in plain words."""
+        same = self.plan.same_lattice
+        if not same:
+            mov = self.plan.mov.name
+            return (f"The {mov} half is already resampled once to the finer pixel size. A refined shift is folded into "
+                    "that same step, so it adds no extra resampling or smoothing.")
+        if self.placement == "whole_pixel":
+            return ("Both halves share a pixel size and whole-pixel placement is on: a refined shift is rounded to a "
+                    "whole pixel, so no voxels are resampled (placement good to half a pixel).")
+        return ("Both halves share a pixel size and whole-pixel placement is off: a sub-pixel refined shift resamples "
+                "the bottom half once (linear), which smooths it slightly.")
 
     def realign_from_image(self) -> tuple[float, float, float]:
         """Fallback: ask the old mask + profile alignment where the bottom half goes."""
@@ -279,6 +363,7 @@ def sidecar_header(state: HeaderState, full: ItkStitch, frame: int, box) -> dict
             "pixel_placement": state.placement,
             "snapped_to_whole_pixel": bool(i["snapped_to_pixel"]),
             "snap_residual_mm": float(i["snap_residual_mm"]),
+            "refine": state.refine_info,
         },
         "header_check": {
             "verdict": c["verdict"], "reasons": list(c["reasons"]),

@@ -55,6 +55,52 @@ class HeaderStateTests(unittest.TestCase):
             self.assertEqual(chk["verdict"], "needs_image_stitch")
             self.assertTrue(chk["reasons"])
 
+    def test_refine_recovers_a_small_header_error_along_and_across(self) -> None:
+        with tempfile.TemporaryDirectory() as t:
+            rig = Rig(Path(t), btm_header_error_z=2.0, btm_header_error_x=1.5)  # header puts the bottom half 2 mm high, 1.5 mm right
+            st = self._state(rig)
+            out = st.refine()
+            self.assertTrue(out.applied, out.note)
+            self.assertAlmostEqual(out.along_mm, 2.0, delta=0.3)  # down 2 mm fixes a half that sits 2 mm high
+            self.assertAlmostEqual(out.across_mm, -1.5, delta=0.3)
+            self.assertGreater(out.score_after, out.score_before)
+            self.assertGreater(out.score_after, 0.99)
+            self.assertIn("refine", st.moved_by)
+            self.assertEqual(st.refine_info["shift_mm"]["along_core"], out.along_mm)
+            self.assertEqual(st.move_mm[2], 0.0)  # depth is never touched by refine
+            st.set_move(*st.move_mm)  # a manual change afterwards drops the refine record
+            self.assertIsNone(st.refine_info)
+
+    def test_refine_leaves_a_correct_placement_alone(self) -> None:
+        st = self._state()
+        out = st.refine()
+        self.assertFalse(out.applied)
+        self.assertEqual(st.move_mm, [0.0, 0.0, 0.0])
+
+    def test_refine_with_whole_pixel_placement_is_never_worse_and_says_when_nothing_changes(self) -> None:
+        with tempfile.TemporaryDirectory() as t:
+            # equal pixel sizes, bottom half 0.3 px off the lattice and 0.5 mm off along the core
+            rig = Rig(Path(t), px_top=0.5, px_btm=0.5, btm_offset=(0.15, 0.0, 0.0), btm_header_error_z=0.5)
+            st = self._state(rig)
+            before = st.join_correlation()
+            out = st.refine()
+            after = st.join_correlation()
+            self.assertGreaterEqual(after, before - 0.002)  # rounding the optimum may not lose ground
+            if not out.applied:
+                self.assertTrue(out.note)
+            st.set_placement("subpixel")
+            out2 = st.refine()
+            self.assertGreater(st.join_correlation(), 0.99)
+
+    def test_refine_note_says_which_resampling_applies(self) -> None:
+        self.assertIn("already resampled once", self._state().refine_note())  # 0.5 vs 0.4 mm
+        with tempfile.TemporaryDirectory() as t:
+            same = Rig(Path(t), px_top=0.5, px_btm=0.5)
+            st = self._state(same)
+            self.assertIn("rounded to a whole pixel", st.refine_note())
+            st.set_placement("subpixel")
+            self.assertIn("resamples the bottom half once", st.refine_note())
+
     def test_alignment_colours_show_each_half_in_its_own_colour(self) -> None:
         st = self._state()
         rgb = st.align_preview(1.0, 1.0)
