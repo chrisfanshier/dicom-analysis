@@ -199,6 +199,12 @@ class SingleViewInMainWindowTests(unittest.TestCase):
             self.skipTest("no display")
         self.app.geometry("1200x800")
         self.app.update()
+        import time
+
+        end = time.time() + 5.0  # the Worklist opens its release 150 ms after start-up
+        while self.app.worklist.catalog is None and time.time() < end:
+            self.app.update()
+            time.sleep(0.02)
 
     def tearDown(self) -> None:
         import os

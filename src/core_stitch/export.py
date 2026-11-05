@@ -243,7 +243,7 @@ def export_accept(
 
     if jpeg and gray is not None:
         jpg_path = out_dir / f"{stem}.jpg"
-        Image.fromarray(gray, mode="L").save(
+        Image.fromarray(gray).save(
             jpg_path, format="JPEG", quality=95, optimize=True,
             dpi=(dpi_for(state.spacing_mm),) * 2,
         )
@@ -252,7 +252,7 @@ def export_accept(
 
     if tiff and gray is not None:
         tif_path = out_dir / f"{stem}.tif"
-        Image.fromarray(gray, mode="L").save(
+        Image.fromarray(gray).save(
             tif_path, format="TIFF", compression="tiff_lzw",
             dpi=(dpi_for(state.spacing_mm),) * 2,
         )
@@ -264,7 +264,7 @@ def export_accept(
         hu_min = float(np.min(hu))
         hu16 = np.clip(np.rint(hu - hu_min), 0, 65535).astype(np.uint16)
         tif_hu = out_dir / f"{stem}_hu.tif"
-        Image.fromarray(hu16, mode="I;16").save(
+        Image.fromarray(hu16).save(
             tif_hu, format="TIFF", compression="tiff_lzw",
             dpi=(dpi_for(state.spacing_mm),) * 2,
         )

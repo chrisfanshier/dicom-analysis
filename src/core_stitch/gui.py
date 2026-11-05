@@ -1202,7 +1202,7 @@ class StitchGui(tk.Tk):
         except Exception as exc:
             self.status.set(f"Preview failed: {exc}")
             return
-        full = Image.fromarray(arr, mode="L" if arr.ndim == 2 else "RGB")
+        full = Image.fromarray(arr)
         self._full_im = full
         try:
             auto = auto_bounds(mask, box, spacing)
