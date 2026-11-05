@@ -55,6 +55,30 @@ class HeaderStateTests(unittest.TestCase):
             self.assertEqual(chk["verdict"], "needs_image_stitch")
             self.assertTrue(chk["reasons"])
 
+    def test_alignment_colours_show_each_half_in_its_own_colour(self) -> None:
+        st = self._state()
+        rgb = st.align_preview(1.0, 1.0)
+        self.assertEqual(rgb.ndim, 3)
+        self.assertEqual(rgb.shape[2], 3)
+        self.assertEqual(rgb.dtype, np.uint8)
+        top_fp = (st.res.ref_footprint if st.res.reference.name == "top" else st.res.mov_footprint)[0]
+        btm_fp = (st.res.ref_footprint if st.res.reference.name == "bottom" else st.res.mov_footprint)[0]
+        r0, r1, c0, c1 = st.crop_box(3.0)
+        tf, bf = top_fp[r0:r1, c0:c1], btm_fp[r0:r1, c0:c1]
+        core = rgb.max(axis=2) > 0
+        top_only = core & tf & ~bf
+        btm_only = core & bf & ~tf
+        both = core & tf & bf
+        self.assertGreater(int(top_only.sum()), 100)
+        self.assertGreater(int(btm_only.sum()), 100)
+        self.assertGreater(int(both.sum()), 100)
+        self.assertTrue(np.all(rgb[top_only][:, 1] == 0))  # top only: magenta (no green)
+        self.assertTrue(np.all(rgb[top_only][:, 0] == rgb[top_only][:, 2]))
+        self.assertTrue(np.all(rgb[btm_only][:, [0, 2]] == 0))  # bottom only: green
+        # overlap: most pixels carry both colours (pixels below the display window are black in a channel)
+        self.assertGreater(float((rgb[both][:, 1] > 0).mean()), 0.8)
+        self.assertGreater(float((rgb[both][:, 0] > 0).mean()), 0.8)
+
     def test_export_products_geometry_and_plain_sidecar(self) -> None:
         st = self._state()
         out = self.dir / "out"
@@ -151,6 +175,14 @@ class HeaderGuiTests(unittest.TestCase):
         self.assertIsNotNone(app._full_im)
         self.assertGreaterEqual(len(app.canvas.find_withtag("coreguide")), 4)
         self.assertEqual([c for c in app.winfo_children() if c.winfo_class() == "Toplevel"], [])
+
+        # the alignment-colours checkbox switches the picture between colour overlay and grey
+        app.align_var.set(True)
+        app.refresh()
+        self.assertEqual(app._full_im.mode, "RGB")
+        app.align_var.set(False)
+        app.refresh()
+        self.assertEqual(app._full_im.mode, "L")
 
         # arrow keys shift the bottom half (Down = along the core); the controls follow
         app._nudge_keys(0, 5)

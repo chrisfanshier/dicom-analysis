@@ -949,6 +949,9 @@ class StitchGui(tk.Tk):
         self._schedule_refresh()
 
     def _on_fuse_mode(self) -> None:
+        if self._hdr_active():
+            self.status.set("Overlap fuse is fixed in scanner-geometry mode: the average, with edge rows trimmed.")
+            return
         if self.state is None:
             return
         self.state.fuse_mode = str(self.fuse_mode.get() or "max")
@@ -1385,7 +1388,10 @@ class StitchGui(tk.Tk):
             return
         try:
             if single:
-                arr = self.single.gray_preview()
+                if isinstance(self.single, HeaderState) and self.align_var.get():
+                    arr = self.single.align_preview(float(self.opacity_a.get()), float(self.opacity_b.get()))
+                else:
+                    arr = self.single.gray_preview()
                 box = self.single.crop_box(3.0)
                 mask = self.single.core_mask()
                 spacing = self.single.spacing_mm

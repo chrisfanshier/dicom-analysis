@@ -20,6 +20,7 @@ from pydicom.dataset import FileDataset, FileMetaDataset
 from pydicom.uid import ExplicitVRLittleEndian, generate_uid
 
 from core_stitch.header_check import header_check
+from core_stitch.overlap import alignment_rgb
 from core_stitch.itk_stitch import Half, ItkStitch, image_based_move_mm, load_half, plan_stitch, render_plan
 from core_stitch.pipeline import core_crop_box, crop_to_box
 from core_stitch.scale import auto_bounds, core_scale_block, dpi_for
@@ -125,6 +126,23 @@ class HeaderState:
         if crop:
             img = crop_to_box(img, self.crop_box(pad_mm))
         return np.clip((img - lo) / (hi - lo) * 255.0, 0, 255).astype(np.uint8)
+
+    def align_preview(self, opacity_a: float = 0.75, opacity_b: float = 0.75, pad_mm: float = 3.0, crop: bool = True) -> np.ndarray:
+        """Alignment colours: TOP magenta, BOTTOM green, each as resampled (not fused), on the shared grid.
+
+        Where the halves overlap and agree the colours add to grey/white; a misplaced half shows
+        as magenta/green fringes or doubled features.
+        """
+        r = self.res
+        top_is_ref = r.reference.name == "top"
+        top_vol, top_core = (r.ref_vol[0], r.ref_core[0]) if top_is_ref else (r.mov_vol[0], r.mov_core[0])
+        btm_vol, btm_core = (r.mov_vol[0], r.mov_core[0]) if top_is_ref else (r.ref_vol[0], r.ref_core[0])
+        lo, hi = self.window_limits()
+        rgb = alignment_rgb(top_vol, btm_vol, top_core, btm_core, lo=lo, hi=hi, opacity_a=opacity_a, opacity_b=opacity_b)
+        if crop:
+            r0, r1, c0, c1 = self.crop_box(pad_mm)
+            rgb = rgb[r0:r1, c0:c1]
+        return rgb
 
     # ----- text for the GUI -----
     def summary(self) -> str:
