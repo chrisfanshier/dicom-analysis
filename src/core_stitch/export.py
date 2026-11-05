@@ -247,7 +247,7 @@ def export_accept(
             jpg_path, format="JPEG", quality=95, optimize=True,
             dpi=(dpi_for(state.spacing_mm),) * 2,
         )
-        meta["export_jpeg"] = str(jpg_path)
+        meta["export_jpeg"] = jpg_path.name
         paths["jpeg"] = jpg_path
 
     if tiff and gray is not None:
@@ -256,7 +256,7 @@ def export_accept(
             tif_path, format="TIFF", compression="tiff_lzw",
             dpi=(dpi_for(state.spacing_mm),) * 2,
         )
-        meta["export_tiff"] = str(tif_path)
+        meta["export_tiff"] = tif_path.name
         paths["tiff"] = tif_path
 
         # 16-bit storage of HU (offset so negatives fit uint16); recover: hu = px + offset
@@ -268,7 +268,7 @@ def export_accept(
             tif_hu, format="TIFF", compression="tiff_lzw",
             dpi=(dpi_for(state.spacing_mm),) * 2,
         )
-        meta["export_tiff_hu"] = str(tif_hu)
+        meta["export_tiff_hu"] = tif_hu.name
         meta["export_tiff_hu_offset"] = hu_min
         meta["export_tiff_hu_spacing_mm"] = state.spacing_mm
         paths["tiff_hu"] = tif_hu
@@ -289,7 +289,7 @@ def export_accept(
         fused2d = crop_to_box(fused2d, box)
         npy_path = out_dir / f"{stem}_fused.npy"
         np.save(npy_path, fused2d.astype(np.float32))
-        meta["export_npy"] = str(npy_path)
+        meta["export_npy"] = npy_path.name
         paths["npy"] = npy_path
 
     volume = None
@@ -304,7 +304,7 @@ def export_accept(
             z_spacing_mm=z_mm,
             out_dir=out_dir,
         )
-        meta["export_dicom_dir"] = str(dicom_dir)
+        meta["export_dicom_dir"] = dicom_dir.name
         meta["export_dicom_series_uid"] = series_uid
         meta["export_mpr_shape_zyx"] = [int(x) for x in volume.shape]
         meta["export_mpr_z_spacing_mm"] = float(z_mm)
@@ -313,7 +313,7 @@ def export_accept(
     if npy and volume is not None and z_mm is not None:
         vol_npy = out_dir / f"{stem}_mpr.npy"
         np.save(vol_npy, volume.astype(np.float32))
-        meta["export_mpr_npy"] = str(vol_npy)
+        meta["export_mpr_npy"] = vol_npy.name
         meta["export_mpr_shape_zyx"] = [int(x) for x in volume.shape]
         meta["export_mpr_z_spacing_mm"] = float(z_mm)
         paths["mpr_npy"] = vol_npy

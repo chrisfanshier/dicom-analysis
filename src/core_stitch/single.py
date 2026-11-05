@@ -96,7 +96,6 @@ def sidecar_single(state: SingleState) -> dict:
         "version": "0.1.0",
         "unstitched": True,
         "series": {
-            "path": str(s.path),
             "series_uid": s.series_uid,
             "series_description": s.series_description,
             "n_slices": state.n_frames,
@@ -158,19 +157,19 @@ def export_single(
     if jpeg:
         p = out_dir / f"{stem}.jpg"
         Image.fromarray(gray, mode="L").save(p, format="JPEG", quality=95, optimize=True, dpi=dpi)
-        meta["export_jpeg"] = str(p)
+        meta["export_jpeg"] = p.name
         paths["jpeg"] = p
     if tiff:
         p = out_dir / f"{stem}.tif"
         Image.fromarray(gray, mode="L").save(p, format="TIFF", compression="tiff_lzw", dpi=dpi)
-        meta["export_tiff"] = str(p)
+        meta["export_tiff"] = p.name
         paths["tiff"] = p
         hu = crop_to_box(state.half.image, box)
         hu_min = float(np.min(hu))
         hu16 = np.clip(np.rint(hu - hu_min), 0, 65535).astype(np.uint16)
         p16 = out_dir / f"{stem}_hu.tif"
         Image.fromarray(hu16, mode="I;16").save(p16, format="TIFF", compression="tiff_lzw", dpi=dpi)
-        meta["export_tiff_hu"] = str(p16)
+        meta["export_tiff_hu"] = p16.name
         meta["export_tiff_hu_offset"] = hu_min
         meta["export_tiff_hu_spacing_mm"] = state.spacing_mm
         paths["tiff_hu"] = p16

@@ -85,14 +85,11 @@ Added when the export was started from the Worklist tab.
 
 | Field | Plain meaning |
 |---|---|
-| `job_key` | Unique ID of this piece of work (scan folder, view, and the two series). |
 | `job_kind` | `pair` (two halves stitched) or `single` (one scan, no join). |
-| `stitch_group` | The scan folder in the catalog. |
-| `catalog_release` | Which catalog release the information came from. |
 | `cruise_folder`, `core_name`, `section_key` | Where the scan belongs: cruise, core, section. |
 | `export_version` | 1 for the first export of this job, 2 for the next, and so on. Older versions are kept. |
 | `catalog_section_length_cm` | The master-list section length used for the length check. |
-| `series` | The scan series used: `a` (and `b` for a pair) with folder, description and plane. |
+| `series` | The scan series used: `a` (and `b` for a pair) with series ID, description and plane. |
 
 ## About the scan and the export (all exports)
 
@@ -107,10 +104,10 @@ Added when the export was started from the Worklist tab.
 | `export_crop_box_r0r1c0c1` | The part of the full working image that was kept: first row, last row, first column, last column. |
 | `export_jpeg_pad_mm`, `export_jpeg_cropped` | The margin left around the core when cropping, in mm, and whether cropping was on. |
 | `window_lo`, `window_hi`, `export_window_lo`, `export_window_hi` | The greyscale window: HU values shown as black and white in the JPEG/8-bit TIFF. |
-| `export_jpeg`, `export_tiff`, `export_tiff_hu`, `export_npy`, `export_mpr_npy` | Full paths of the files written. |
+| `export_jpeg`, `export_tiff`, `export_tiff_hu`, `export_npy`, `export_mpr_npy` | Names of the files written (no folder paths). |
 | `export_tiff_hu_offset` | To get real HU from `_hu.tif`: HU = pixel value + this number. |
 | `export_tiff_hu_spacing_mm` | Pixel size of the HU TIFF in mm. |
-| `export_dicom_dir`, `export_dicom_series_uid` | Folder and ID of the DICOM stack, if written. |
+| `export_dicom_dir`, `export_dicom_series_uid` | Name of the DICOM folder and ID of the DICOM stack, if written. |
 | `export_mpr_shape_zyx`, `export_mpr_z_spacing_mm` | Size of the 3D stack and the gap between its slices in mm. |
 | `export_view_z` | Which slice of the stack the 2D picture shows. |
 
@@ -118,7 +115,7 @@ Added when the export was started from the Worklist tab.
 
 | Field | Plain meaning |
 |---|---|
-| `series` | The scan used: folder, series ID, description, slice count, and spacing (mm) as slice, row, column. |
+| `series` | The scan used: series ID, description, slice count, and spacing (mm) as slice, row, column. |
 | `frame` | Which slice (frame) of the scan the picture was made from. |
 | `upright_deg` | How far the picture was turned so the core runs top to bottom. |
 | `window_lo`, `window_hi` | Greyscale window in HU. |
@@ -127,7 +124,7 @@ Added when the export was started from the Worklist tab.
 
 | Field | Plain meaning |
 |---|---|
-| `fixed`, `mobile` | The two scans joined: the top half (`fixed`) and the bottom half (`mobile`): folder, series ID, description. |
+| `fixed`, `mobile` | The two scans joined: the top half (`fixed`) and the bottom half (`mobile`): series ID and description. |
 | `flip` | Whether the bottom half was flipped before joining. |
 | `roll_deg` | Turn of the bottom half around the core's long axis, in degrees. |
 | `nudge_x_mm`, `nudge_y_mm`, `nudge_z_mm` | Hand adjustments to the bottom half: across the image, down the core, and through the stack. |
@@ -135,11 +132,8 @@ Added when the export was started from the Worklist tab.
 | `match_hu` | Whether the bottom half's brightness was matched to the top half. |
 | `view_z` | Slice shown while aligning. |
 | `n_slices` | Slices in the joined stack. |
-| `overlap_mm`, `overlap_px` | How far the bottom half was slid along the core to line up with the top half. |
-| `total_lag_px` | The overlap slide plus the hand nudge down the core, in pixels. |
+| `total_lag_px` | Where the bottom half starts: its first row sits this many pixels below the top half's first row. A larger number means a smaller overlap. This is the final position, including hand nudges and refine. |
 | `total_col_offset_px` | The hand nudge across the core, in pixels. |
-| `peak_score`, `second_score`, `peak_ratio` | How well the best overlap fit matches, the next best, and the ratio. A high ratio means a clear answer. |
-| `low_confidence` | `true` when the overlap match was not convincing. Look at these joins. |
 | `refine` | Optional fine adjustment: shifts in mm and pixels, the match score before and after, and the method. Empty if not used. |
 
 ---

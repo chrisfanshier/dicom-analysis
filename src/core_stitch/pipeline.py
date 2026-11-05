@@ -764,17 +764,14 @@ def build_stitched_mpr(state: StitchState) -> tuple[np.ndarray, float]:
 
 
 def sidecar_dict(state: StitchState) -> dict:
-    ov = state.overlap
     ref = state.refine
     return {
         "version": "0.1.0",
         "fixed": {
-            "path": str(state.fixed.series.path),
             "series_uid": state.fixed.series.series_uid,
             "series_description": state.fixed.series.series_description,
         },
         "mobile": {
-            "path": str(state.mobile_base.series.path),
             "series_uid": state.mobile_base.series.series_uid,
             "series_description": state.mobile_base.series.series_description,
         },
@@ -790,14 +787,8 @@ def sidecar_dict(state: StitchState) -> dict:
         "window_hi": state.window_hi,
         "view_z": state.view_z,
         "n_slices": None if state.posed is None else state.posed.n_slices,
-        "overlap_mm": None if ov is None else ov.offset_mm,
-        "overlap_px": None if ov is None else ov.offset_px,
         "total_lag_px": state.total_lag_px,
         "total_col_offset_px": state.total_col_offset_px,
-        "peak_score": None if ov is None else ov.peak_score,
-        "second_score": None if ov is None else ov.second_score,
-        "peak_ratio": None if ov is None else ov.peak_ratio,
-        "low_confidence": None if ov is None else ov.low_confidence,
         "refine": None
         if ref is None
         else {

@@ -546,20 +546,17 @@ class WorklistPanel(ttk.Frame):
         while (base / f"v{version:03d}").exists():  # never overwrite an existing folder
             version += 1
         extra = {
-            "job_key": job.key,
             "job_kind": job.kind,
-            "stitch_group": job.stitch_group,
-            "catalog_release": str(self.catalog.release_root),
             "cruise_folder": g.cruise_folder,
             "core_name": g.core_name,
             "section_key": g.section_key,
             "export_version": version,
             "catalog_section_length_cm": g.expected_length_cm,
             "series": {
-                "a": {"uid": job.a.series_uid, "folder": str(job.a.path), "description": job.a.description,
+                "a": {"uid": job.a.series_uid, "description": job.a.description,
                       "plane": job.a.plane},
                 "b": None if job.b is None else {
-                    "uid": job.b.series_uid, "folder": str(job.b.path), "description": job.b.description,
+                    "uid": job.b.series_uid, "description": job.b.description,
                     "plane": job.b.plane},
             },
         }
