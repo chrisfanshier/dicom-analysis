@@ -212,10 +212,15 @@ def render_plan(
     interpolator: str = "linear",
     trim_rows: int = 3,
     z_keep: tuple[int, int] | None = None,
+    y_keep: tuple[int, int] | None = None,
+    threshold_masks: bool = False,
 ) -> ItkStitch:
     """Resample both halves onto the planned grid and fuse them.
 
     ``z_keep=(first, last)`` renders only those output slices (fast preview of one slice).
+    ``y_keep=(first, last)`` renders only those output rows (a band, or a single row for a cross-section).
+    ``threshold_masks`` marks the core by a plain threshold instead of the per-slice largest component,
+    which is what a one-row render needs.
     """
     if interpolator not in INTERPOLATORS:
         raise ValueError(f"interpolator must be one of {tuple(INTERPOLATORS)}")
@@ -230,6 +235,13 @@ def render_plan(
         z1 = int(np.clip(z_keep[1], z0, plan.n_slices - 1))
         lo[2] = lo[2] + z0
         size[2] = z1 - z0 + 1
+    row_offset = 0
+    if y_keep is not None:
+        y0 = int(np.clip(y_keep[0], 0, plan.size[1] - 1))
+        y1 = int(np.clip(y_keep[1], y0, plan.size[1] - 1))
+        lo[1] = lo[1] + y0
+        size[1] = y1 - y0 + 1
+        row_offset = y0
     grid = sitk.Image(size, sitk.sitkFloat32)
     grid.SetSpacing(rimg.GetSpacing())
     grid.SetDirection(rimg.GetDirection())
@@ -251,6 +263,8 @@ def render_plan(
 
     # core masks (same recipe as the existing pipeline: threshold + largest component per slice)
     def core(vol: np.ndarray, fp: np.ndarray, h: Half) -> np.ndarray:
+        if threshold_masks:
+            return (vol > h.threshold) & fp
         out = np.zeros(vol.shape, bool)
         for z in range(vol.shape[0]):
             if fp[z].any():
@@ -294,6 +308,7 @@ def render_plan(
         output_spacing=[float(x) for x in grid.GetSpacing()],
         overlap_rows=None if ov_rows.size == 0 else [int(ov_rows[0]), int(ov_rows[-1])],
         overlap_mm=0.0 if ov_rows.size == 0 else float((ov_rows[-1] - ov_rows[0] + 1) * px),
+        output_row_offset=int(row_offset),
         trim_rows=int(trim_rows), crop_pad_mm=crop_pad_mm,
         sitk_version=sitk.Version_VersionString(),
     )
@@ -471,3 +486,102 @@ def refine_translation(
     if not (after > before + 1e-4):
         return RefineOutcome(0.0, 0.0, before, after, False, "Refine found no better position; nothing was changed.", iters)
     return RefineOutcome(along, across, before, after, True, "", iters)
+
+
+def join_quality(
+    res: ItkStitch,
+    *,
+    edge_rows: int = 4,
+    max_px: int = 3,
+    max_slices: int = 3,
+) -> dict:
+    """How well do the two halves agree over the overlap, and is any other position clearly better?
+
+    Works on any render that contains the overlap (a row band is enough).  It reports
+
+    * the correlation of the two halves over the overlap core at the placement as rendered, and
+    * the same correlation with the bottom half's voxels shifted by up to ``max_px`` pixels along the
+      core, ``max_px`` across it, and ``max_slices`` slices in depth (one axis at a time).
+
+    At a good join the best shift is 0 on every axis.  An axis is flagged when the best shift is at least
+    2 pixels (1 slice in depth) away and beats the current placement by more than a per-axis margin.  The
+    margins differ because the axes differ in sensitivity: on real cores one slice of depth error costs
+    ~0.05 in correlation, a pixel across the core ~0.005, a pixel along the core only ~0.0002 (layering
+    is smooth down the core).  A shift of one pixel is never flagged: a placement that is right to
+    sub-pixel precision often has its best whole-pixel shift at 0 or 1.  Only whole voxels are tried, so
+    this is a check, not a refinement.
+    """
+    keep = edge_rows + max_px
+    both_all = res.ref_core & res.mov_core & res.ref_footprint & res.mov_footprint
+    rows_all = np.where(both_all.any(axis=(0, 2)))[0]
+    if rows_all.size < 2 * keep + 8:
+        return {"evaluated": False, "reason": "too little overlap to evaluate"}
+    # work on the overlap band only (a full volume has tens of millions of voxels)
+    r0 = max(int(rows_all.min()) - keep - 2, 0)
+    r1 = min(int(rows_all.max()) + keep + 3, both_all.shape[1])
+    band = np.s_[:, r0:r1, :]
+    ref_vol, mov_vol = res.ref_vol[band], res.mov_vol[band]
+    mr = (res.ref_core & res.ref_footprint)[band]
+    mm = (res.mov_core & res.mov_footprint)[band]
+    both = both_all[band]
+    rows = np.where(both.any(axis=(0, 2)))[0]
+    window = np.zeros(both.shape, bool)  # interior rows of the overlap, away from either half's edge
+    window[:, rows.min() + keep : rows.max() - keep + 1, :] = True
+
+    def shifted(a: np.ndarray, axis: int, s: int) -> np.ndarray:
+        out = np.zeros_like(a)
+        src = [slice(None)] * 3
+        dst = [slice(None)] * 3
+        if s > 0:
+            src[axis], dst[axis] = slice(None, -s), slice(s, None)
+        elif s < 0:
+            src[axis], dst[axis] = slice(-s, None), slice(None, s)
+        else:
+            return a
+        out[tuple(dst)] = a[tuple(src)]
+        return out
+
+    def ncc(axis: int, s: int) -> float | None:
+        m = window & mr & shifted(mm, axis, s)
+        if m.sum() < 500:
+            return None
+        a = ref_vol[m].astype(np.float64)
+        b = shifted(mov_vol, axis, s)[m].astype(np.float64)
+        a = (a - a.mean()) / (a.std() + 1e-9)
+        b = (b - b.mean()) / (b.std() + 1e-9)
+        return float((a * b).mean())
+
+    base = ncc(0, 0)
+    if base is None:
+        return {"evaluated": False, "reason": "too little overlap core to evaluate"}
+    voxels = int((window & mr & mm).sum())
+    names = {0: "depth_slices", 1: "along_px", 2: "across_px"}
+    limit = {0: max_slices, 1: max_px, 2: max_px}
+    min_gain = {"depth_slices": 0.005, "along_px": 1e-4, "across_px": 1e-3}
+    min_shift = {"depth_slices": 1, "along_px": 2, "across_px": 2}
+    best_shift, best_corr, scans, flags = {}, {}, {}, []
+    for axis in (0, 1, 2):
+        vals = {s: ncc(axis, s) for s in range(-limit[axis], limit[axis] + 1)}
+        vals = {s: v for s, v in vals.items() if v is not None}
+        b = max(vals, key=vals.get)
+        best_shift[names[axis]], best_corr[names[axis]] = int(b), round(vals[b], 4)
+        scans[names[axis]] = {str(s): round(v, 4) for s, v in sorted(vals.items())}
+        if abs(b) >= min_shift[names[axis]] and vals[b] - base > min_gain[names[axis]]:
+            px = float(res.grid.GetSpacing()[0])
+            dz = float(res.grid.GetSpacing()[2])
+            what = {"depth_slices": f"{b:+d} slices ({b * dz:+.1f} mm) in depth",
+                    "along_px": f"{b:+d} px ({b * px:+.2f} mm) along the core",
+                    "across_px": f"{b:+d} px ({b * px:+.2f} mm) across the core"}[names[axis]]
+            flags.append(f"the halves agree better if the bottom half is moved {what} (correlation {base:.3f} -> {vals[b]:.3f})")
+    return {
+        "evaluated": True,
+        "correlation": round(base, 4),
+        "voxels": voxels,
+        "slices": int(both.shape[0]),
+        "best_shift": best_shift,
+        "correlation_at_best_shift": best_corr,
+        "scan": scans,
+        "consistent": not flags,
+        "flags": flags,
+        "note": "correlation of the two halves over the overlap core; shifts are whole voxels of the output grid, one axis at a time",
+    }

@@ -27,6 +27,7 @@ from core_stitch.itk_stitch import (
     ItkStitch,
     RefineOutcome,
     image_based_move_mm,
+    join_quality as _join_quality,
     load_half,
     plan_stitch,
     refine_translation,
@@ -50,6 +51,7 @@ class HeaderState:
         self.moved_by = "scanner header"  # or "image alignment" after Re-align
         self.refine_info: dict | None = None  # set by refine(); cleared when the shift is changed by hand
         self._undo: tuple | None = None  # (move_mm, moved_by, refine_info) from before the last refine
+        self.last_quality: dict | None = None
         self.window_lo: float | None = None
         self.window_hi: float | None = None
         self.warnings: list[str] = []
@@ -145,6 +147,50 @@ class HeaderState:
             "iterations": out.iterations,
         }
         return RefineOutcome(out.along_mm, out.across_mm, before_corr, after_corr, True, "", out.iterations)
+
+    def join_quality(self) -> dict:
+        """Correlation over the overlap at the current placement, plus a scan of nearby positions.
+
+        Renders just the overlap band (all slices), so it takes a second or two.
+        """
+        ov = self.res.info["overlap_rows"]
+        if ov is None:
+            q = {"evaluated": False, "reason": "the halves do not overlap"}
+        else:
+            a, b = max(ov[0] - 16, 0), min(ov[1] + 16, self.plan.size[1] - 1)
+            band = render_plan(self.plan, trim_rows=TRIM_ROWS, y_keep=(a, b))
+            q = _join_quality(band)
+        self.last_quality = q
+        return q
+
+    def cross_section(self, frac: float = 0.5) -> tuple[np.ndarray, dict]:
+        """Alignment colours across the core (depth x width) at a row inside the overlap.
+
+        If the join is right the two halves' cross-sections coincide; a depth error shows them displaced
+        and a tilt shows one lopsided.  Returns (RGB, info) with the share of the two outlines that overlap.
+        """
+        ov = self.res.info["overlap_rows"]
+        if ov is None:
+            raise ValueError("the halves do not overlap, so there is no cross-section to compare")
+        row = int(round(ov[0] + float(np.clip(frac, 0.0, 1.0)) * (ov[1] - ov[0])))
+        r = render_plan(self.plan, trim_rows=0, y_keep=(row, row), threshold_masks=True)
+        top_is_ref = r.reference.name == "top"
+        tv, tm = (r.ref_vol[:, 0, :], r.ref_core[:, 0, :]) if top_is_ref else (r.mov_vol[:, 0, :], r.mov_core[:, 0, :])
+        bv, bm = (r.mov_vol[:, 0, :], r.mov_core[:, 0, :]) if top_is_ref else (r.ref_vol[:, 0, :], r.ref_core[:, 0, :])
+        lo, hi = self.window_limits()
+        rgb = alignment_rgb(tv, bv, tm, bm, lo=lo, hi=hi, opacity_a=1.0, opacity_b=1.0)
+        cols = np.where((tm | bm).any(axis=0))[0]
+        if cols.size:
+            rgb = rgb[:, max(int(cols.min()) - 15, 0) : int(cols.max()) + 16]
+        union = int((tm | bm).sum())
+        spacing = r.grid.GetSpacing()
+        info = {
+            "row": row,
+            "outline_overlap": float((tm & bm).sum() / union) if union else float("nan"),
+            "slice_step_over_pixel": float(spacing[2] / spacing[0]),
+            "pixel_mm": float(spacing[0]),
+        }
+        return rgb, info
 
     def can_undo_refine(self) -> bool:
         return self._undo is not None
@@ -439,6 +485,7 @@ def export_header(
     meta["view_slice"] = frame
     meta["n_slices"] = int(full.volume.shape[0])
     meta["window_lo"], meta["window_hi"] = float(lo), float(hi)
+    meta["join_quality"] = _join_quality(full)
     meta["export_jpeg_pad_mm"] = pad_mm
     meta["export_crop_box_r0r1c0c1"] = [int(x) for x in box]
     meta["export_shape_px"] = [int(gray.shape[0]), int(gray.shape[1])]

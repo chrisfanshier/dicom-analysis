@@ -71,6 +71,39 @@ class HeaderStateTests(unittest.TestCase):
             st.set_move(*st.move_mm)  # a manual change afterwards drops the refine record
             self.assertIsNone(st.refine_info)
 
+    def test_join_quality_is_clean_for_a_good_join_and_flags_depth_and_in_plane_errors(self) -> None:
+        q = self._state().join_quality()
+        self.assertTrue(q["evaluated"])
+        self.assertTrue(q["consistent"], q["flags"])
+        self.assertGreater(q["correlation"], 0.99)
+        self.assertEqual(q["best_shift"], {"depth_slices": 0, "along_px": 0, "across_px": 0})
+        with tempfile.TemporaryDirectory() as t:
+            depth = self._state(Rig(Path(t), btm_header_error_y=4.0)).join_quality()  # header: bottom stack 2 slices off
+            self.assertFalse(depth["consistent"])
+            self.assertEqual(abs(depth["best_shift"]["depth_slices"]), 2)
+            self.assertTrue(any("depth" in f for f in depth["flags"]))
+        with tempfile.TemporaryDirectory() as t:
+            along = self._state(Rig(Path(t), btm_header_error_z=1.2)).join_quality()  # 3 pixels along the core
+            self.assertFalse(along["consistent"], along["scan"]["along_px"])
+            self.assertEqual(abs(along["best_shift"]["along_px"]), 3)
+
+    def test_cross_section_outlines_coincide_for_a_good_join_and_separate_with_a_depth_error(self) -> None:
+        good_rgb, good = self._state().cross_section(0.5)
+        self.assertEqual(good_rgb.shape[2], 3)
+        self.assertGreater(good["outline_overlap"], 0.95)
+        with tempfile.TemporaryDirectory() as t:
+            _, bad = self._state(Rig(Path(t), btm_header_error_y=4.0)).cross_section(0.5)
+            self.assertLess(bad["outline_overlap"], good["outline_overlap"] - 0.05)
+
+    def test_export_records_the_join_quality(self) -> None:
+        st = self._state()
+        paths = export_header(st, self.dir / "jq", stem="s")
+        meta = json.loads(paths["json"].read_text(encoding="utf-8"))
+        q = meta["join_quality"]
+        self.assertTrue(q["evaluated"])
+        self.assertTrue(q["consistent"])
+        self.assertIn("scan", q)
+
     def test_undo_refine_restores_the_earlier_position_and_the_live_correlation_is_shown(self) -> None:
         with tempfile.TemporaryDirectory() as t:
             rig = Rig(Path(t), btm_header_error_z=2.0)
@@ -248,6 +281,13 @@ class HeaderGuiTests(unittest.TestCase):
         app.align_var.set(False)
         app.refresh()
         self.assertEqual(app._full_im.mode, "L")
+
+        # the cross-section panel draws, and the join check gives a plain answer
+        app._hdr_xsec_refresh()
+        self.assertIsNotNone(app._xsec_photo)
+        self.assertIn("overlap by", app.hdr_xsec_label.get())
+        app._hdr_check_quality()
+        self.assertIn("consistent", app.hdr_quality.get())
 
         # arrow keys shift the bottom half (Down = along the core); the controls follow
         app._nudge_keys(0, 5)

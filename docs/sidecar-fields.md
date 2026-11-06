@@ -165,6 +165,7 @@ The older fields in the table above (`fixed`, `mobile`, `flip`, `roll_deg`, `nud
 | `join.top_rows_in_image`, `bottom_rows_in_image` | The rows of the picture that each half covers. |
 | `join.fuse` | How the halves were combined in the overlap (the average, except right at each half's image edge, where only the other half is used). |
 | `join.outside_core_fill_hu` | The HU value used outside the core (real air). |
+| `join_quality` | A check made on every export, over the overlap in all slices. `correlation` is how well the two halves agree there (1 = identical). `scan` and `best_shift` try moving the bottom half by whole voxels, one axis at a time (up to 3 pixels along and across the core, 3 slices in depth): at a good join the best shift is 0 on every axis. `consistent` is false and `flags` explain it when some other position is clearly better (2 or more pixels away, or 1 or more slices). It is a check, not a refinement: nothing is moved. Depth errors show strongly here; errors along the core change the correlation only slightly, so they are flagged by where the peak is, not by how much the number drops. |
 | `view_slice`, `n_slices` | Which slice the 2D picture shows, and how many slices the stack has. |
 
 ## Example: building a ruler in Python

@@ -65,6 +65,11 @@ class StitchGui(tk.Tk):
         self.hdr_whole_pixel = tk.BooleanVar(value=True)
         self.hdr_info = tk.StringVar(value="")
         self.hdr_check = tk.StringVar(value="")
+        self.hdr_quality = tk.StringVar(value="")
+        self.hdr_xsec_label = tk.StringVar(value="")
+        self.hdr_xsec_frac = tk.DoubleVar(value=0.5)
+        self._xsec_photo = None
+        self._xsec_job: str | None = None
         self.hdr_refine_note = tk.StringVar(value="")
         self.hdr_refine_result = tk.StringVar(value="")
         self._hdr_job: str | None = None
@@ -301,6 +306,28 @@ class StitchGui(tk.Tk):
             "alignment (about a minute) and starts from its answer.",
             wraplength=320, font=("", 8),
         ).pack(anchor=tk.W)
+        self._build_header_checks(parent)
+
+    def _build_header_checks(self, parent: ttk.Frame) -> None:
+        box = ttk.LabelFrame(parent, text="Check the join", padding=6)
+        box.pack(fill=tk.X, pady=(12, 0))
+        ttk.Label(
+            box,
+            text="Cross-section across the core at a row inside the overlap (top magenta, bottom green). "
+            "When the join is right the two outlines coincide; a depth error shows them displaced.",
+            wraplength=320, font=("", 8),
+        ).pack(anchor=tk.W)
+        self._xsec_canvas = tk.Canvas(box, width=320, height=210, bg="#0b0b0b", highlightthickness=0)
+        self._xsec_canvas.pack(pady=(4, 2))
+        ttk.Label(box, textvariable=self.hdr_xsec_label, wraplength=320, font=("", 8)).pack(anchor=tk.W)
+        row = ttk.Frame(box)
+        row.pack(fill=tk.X)
+        ttk.Label(row, text="Row in overlap").pack(side=tk.LEFT)
+        ttk.Scale(row, from_=0.0, to=1.0, variable=self.hdr_xsec_frac, command=lambda _v: self._hdr_xsec_soon()).pack(
+            side=tk.LEFT, fill=tk.X, expand=True, padx=6
+        )
+        ttk.Button(box, text="Check join quality", command=self._hdr_check_quality).pack(fill=tk.X, pady=(6, 0))
+        ttk.Label(box, textvariable=self.hdr_quality, wraplength=320, font=("", 9)).pack(anchor=tk.W, pady=(4, 0))
 
     def _build_old_align(self, parent: ttk.Frame) -> None:
         parent.columnconfigure(0, weight=1)
@@ -660,6 +687,8 @@ class StitchGui(tk.Tk):
         self.hdr_depth.set(round(st.move_mm[2], 3))
         self.hdr_info.set(st.summary())
         self.hdr_refine_note.set(st.refine_note())
+        self.hdr_quality.set("")  # a new placement: any earlier join-quality result no longer applies
+        self._hdr_xsec_soon()
         text, ok = st.check_text()
         self.hdr_check.set(text)
         self._hdr_check_label.configure(foreground="#15803d" if ok else "#b45309")
@@ -730,6 +759,61 @@ class StitchGui(tk.Tk):
             self.hdr_refine_result.set(out.note + (f" (correlation {out.score_before:.4f}.)" if out.score_before == out.score_before else ""))
             self.status.set("Refine made no change.")
         self._schedule_refresh()
+
+    def _hdr_xsec_soon(self) -> None:
+        if self._xsec_job is not None:
+            self.after_cancel(self._xsec_job)
+        self._xsec_job = self.after(200, self._hdr_xsec_refresh)
+
+    def _hdr_xsec_refresh(self) -> None:
+        self._xsec_job = None
+        if not self._hdr_active():
+            return
+        c = self._xsec_canvas
+        c.delete("all")
+        try:
+            rgb, info = self.single.cross_section(float(self.hdr_xsec_frac.get()))
+        except Exception as exc:
+            c.create_text(160, 105, text=str(exc), fill="#bbb", width=290)
+            self.hdr_xsec_label.set("")
+            return
+        h, w = rgb.shape[:2]
+        # one slice is 2 mm thick but a pixel is under 1 mm: stretch depth so the picture is to scale
+        tall = max(int(round(h * info["slice_step_over_pixel"])), 1)
+        scale = min(316.0 / w, 206.0 / tall)
+        img = Image.fromarray(rgb).resize((max(int(w * scale), 1), max(int(tall * scale), 1)), Image.NEAREST)
+        self._xsec_photo = ImageTk.PhotoImage(img)
+        c.create_image(160, 105, image=self._xsec_photo)
+        ov = info["outline_overlap"]
+        self.hdr_xsec_label.set(
+            f"Row {info['row']} of the stitched picture. The two outlines overlap by {ov * 100:.0f}% (100% = coincide)."
+            if ov == ov else f"Row {info['row']}."
+        )
+
+    def _hdr_check_quality(self) -> None:
+        if not self._hdr_active():
+            messagebox.showinfo("Join quality", "Load a pair first.")
+            return
+        self.status.set("Checking the join over the whole overlap...")
+        self.update_idletasks()
+        try:
+            q = self.single.join_quality()
+        except Exception as exc:
+            messagebox.showerror("Join quality", str(exc))
+            self.status.set(f"Join check failed: {exc}")
+            return
+        if not q.get("evaluated"):
+            self.hdr_quality.set("Could not evaluate: " + q.get("reason", "unknown"))
+        elif q["consistent"]:
+            b = q["best_shift"]
+            self.hdr_quality.set(
+                f"Join looks consistent: correlation {q['correlation']:.4f} over {q['voxels']:,} voxels. "
+                f"No nearby position is better (best shifts: depth {b['depth_slices']:+d} slices, "
+                f"along {b['along_px']:+d} px, across {b['across_px']:+d} px)."
+            )
+        else:
+            self.hdr_quality.set("WARNING: " + "; ".join(q["flags"]) + ".")
+        self.status.set("Join check done.")
 
     def _hdr_undo_refine(self) -> None:
         if not self._hdr_active() or not self.single.undo_refine():

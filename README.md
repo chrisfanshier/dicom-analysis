@@ -81,6 +81,11 @@ join, and the Align tab says what it costs in resampling for the loaded pair: no
 already being resampled to the finer pixel size, a rounding to the nearest pixel when both halves share a pixel size
 and whole-pixel placement is on, and one interpolation when it is off.
 
+**Check the join** (Align tab): a cross-section across the core at a row inside the overlap, with the two halves
+in magenta and green (the outlines coincide when the join is right; a depth error shows them displaced), and a
+**Check join quality** button that scans nearby positions in all three directions. The same check is written to the
+sidecar (`join_quality`) on every export.
+
 The half with the finer pixels is kept exactly as scanned; the other half is resampled once onto its grid.
 Tick or untick **Whole-pixel placement** to choose between keeping every voxel original (when both halves share a
 pixel size) and sub-pixel placement. The older mask-based workflow is still there ("Use scanner geometry" box).
