@@ -27,7 +27,7 @@ core-stitch "D:\path\SE1" "D:\path\SE2"
 Left rail tabs **Align** / **Display** / **Analyze** / **Export**; image fills the right pane.
 
 1. **Align** — open TOP/BTM, coarse align, Flip/Roll/nudge, Refine join  
-2. **Display** — alignment colors, slice browser, crop, zoom, overlap fuse, HU histogram window  
+2. **Display** — alignment colors, slice browser, crop, zoom, HU histogram window  
 3. **Analyze** (optional) — auto sediment ROI, void/clast HU filter (Otsu), downcore mean HU plot, optional 3D mask  
 4. **Export** — stitch products and/or sediment mask / ROI image (Analyze not required for stitch export)  
 

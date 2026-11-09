@@ -12,7 +12,6 @@ from PIL import Image, ImageTk
 
 from core_stitch.export import _crop_box as _export_crop_box
 from core_stitch.export import export_accept
-from core_stitch.overlap import FUSE_MODES
 from core_stitch.scale import auto_bounds
 from core_stitch.header_state import HeaderState, export_header
 from core_stitch.single import SingleState, export_single, prepare_single
@@ -509,29 +508,6 @@ class StitchGui(tk.Tk):
             variable=self.opacity_b,
             command=lambda _v: self._schedule_refresh(),
         ).pack(fill=tk.X)
-
-        fuse = ttk.LabelFrame(parent, text="Overlap fuse", padding=6)
-        fuse.pack(fill=tk.X, pady=(10, 0))
-        self.fuse_combo = ttk.Combobox(
-            fuse,
-            textvariable=self.fuse_mode,
-            values=list(FUSE_MODES),
-            width=12,
-            state="readonly",
-        )
-        self.fuse_combo.pack(fill=tk.X)
-        self.fuse_combo.bind("<<ComboboxSelected>>", lambda _e: self._on_fuse_mode())
-        ttk.Checkbutton(
-            fuse,
-            text="Match HU in overlap",
-            variable=self.match_hu_var,
-            command=self._on_fuse_mode,
-        ).pack(anchor=tk.W, pady=(4, 0))
-        ttk.Label(
-            fuse,
-            text="max / mean / blend / feather / min / a / b",
-            font=("", 8),
-        ).pack(anchor=tk.W)
 
         sl = ttk.LabelFrame(parent, text="Slice / view", padding=6)
         sl.pack(fill=tk.X, pady=(10, 0))
@@ -1297,22 +1273,6 @@ class StitchGui(tk.Tk):
         self._update_metrics()
         self.status.set("Overlap re-searched (nudge reset).")
         self._schedule_refresh()
-
-    def _on_fuse_mode(self) -> None:
-        if self._hdr_active():
-            self.status.set("Overlap fuse is fixed in scanner-geometry mode: the average, with edge rows trimmed.")
-            return
-        if self.state is None:
-            return
-        self.state.fuse_mode = str(self.fuse_mode.get() or "max")
-        self.state.match_hu = bool(self.match_hu_var.get())
-        # Greyscale preview uses fuse mode; alignment colors ignore it
-        if not self.align_var.get():
-            self._schedule_refresh()
-        else:
-            self.status.set(
-                f"Overlap mode={self.state.fuse_mode} (turn off Alignment colors to preview fuse)"
-            )
 
     def _on_nudge_slide(self, _value: str | None = None) -> None:
         if self._nudge_job is not None:
