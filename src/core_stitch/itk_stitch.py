@@ -35,13 +35,14 @@ import SimpleITK as sitk
 from scipy.ndimage import binary_erosion
 
 from core_stitch.geometry import air_value
-from core_stitch.load import MprSeries, load_series
+from core_stitch.load import MprSeries, load_series, turned_series
 from core_stitch.pipeline import _content_mask
 from core_stitch.segment import mid_slice, segment_core
 
 PLACEMENTS = ("whole_pixel", "subpixel")
 INTERPOLATORS = {"linear": sitk.sitkLinear, "bspline": sitk.sitkBSpline, "nearest": sitk.sitkNearestNeighbor}
 SAME_TOL = 1e-3
+ORIENT_MAX_DEG = 30.0  # halves whose image planes differ by more than this are not the same view of the core
 
 
 @dataclass
@@ -91,6 +92,7 @@ class Plan:
     lo: np.ndarray  # first output index, in reference-lattice units
     size: list[int]  # output size (x, y, z)
     crop_pad_mm: float | None
+    orientation_diff_deg: float = 0.0  # angle between the two halves' image planes (0 for the usual identical pair)
 
     @property
     def n_slices(self) -> int:
@@ -103,8 +105,11 @@ def _direction(row: np.ndarray, col: np.ndarray) -> tuple[np.ndarray, tuple[floa
     return normal, tuple(float(x) for x in d.flatten())
 
 
-def load_half(name: str, folder: Path | str, uid: str | None) -> Half:
+def load_half(name: str, folder: Path | str, uid: str | None, *, turn180: bool = False) -> Half:
+    """Load one half.  ``turn180=True`` turns every slice 180 degrees in place (for a half scanned upside down)."""
     series = load_series(folder, uid)
+    if turn180:
+        series = turned_series(series)
     ds = pydicom.dcmread(series.slice_paths[0], stop_before_pixels=True, force=True)
     iop = np.asarray(ds.ImageOrientationPatient, float)
     row, col = iop[:3], iop[3:]
@@ -143,6 +148,15 @@ def _same_lattice(a: Half, b: Half) -> bool:
     return ds < SAME_TOL and dd < SAME_TOL
 
 
+def orientation_difference_deg(a: Half, b: Half) -> float:
+    """Largest angle between the two halves' row, column or normal directions, in degrees (0 = identical planes)."""
+    if np.allclose(np.r_[a.row_dir, a.col_dir], np.r_[b.row_dir, b.col_dir], atol=SAME_TOL):
+        return 0.0
+    angs = [np.degrees(np.arccos(np.clip(float(np.dot(u, v)), -1.0, 1.0)))
+            for u, v in ((a.row_dir, b.row_dir), (a.col_dir, b.col_dir), (a.normal, b.normal))]
+    return float(max(angs))
+
+
 def plan_stitch(
     top: Half,
     bottom: Half,
@@ -160,8 +174,12 @@ def plan_stitch(
     """
     if placement not in PLACEMENTS:
         raise ValueError(f"placement must be one of {PLACEMENTS}")
-    if not np.allclose(np.r_[top.row_dir, top.col_dir], np.r_[bottom.row_dir, bottom.col_dir], atol=SAME_TOL):
-        raise ValueError("The two halves have different orientations; header placement does not apply")
+    orient_deg = orientation_difference_deg(top, bottom)
+    if orient_deg > ORIENT_MAX_DEG:
+        raise ValueError(
+            f"The two halves are cut in planes {orient_deg:.0f} degrees apart, so they are not the same view of the "
+            "core (for example coronal against sagittal) and cannot be joined by their headers."
+        )
     # reference = finer in-plane pixel (top wins a tie)
     pitch = lambda h: min(h.spacing_xyz[0], h.spacing_xyz[1])
     ref, mov = (top, bottom) if pitch(top) <= pitch(bottom) + SAME_TOL else (bottom, top)
@@ -203,7 +221,24 @@ def plan_stitch(
     size = (hi - lo + 1).tolist()
     return Plan(top=top, bottom=bottom, ref=ref, mov=mov, move=move, move_mm_bottom=tuple(float(x) for x in move_mm),
                 placement=placement, same_lattice=bool(same), snapped=bool(snapped), snap_residual_mm=snap_residual_mm,
-                snap_vec=snap_vec, lo=lo, size=size, crop_pad_mm=crop_pad_mm)
+                snap_vec=snap_vec, lo=lo, size=size, crop_pad_mm=crop_pad_mm, orientation_diff_deg=orient_deg)
+
+
+def _core_slice(image: np.ndarray, threshold: float, air: float) -> np.ndarray:
+    """Core = pixels above the half's threshold, largest connected piece.
+
+    Unlike the older ``_content_mask`` this never flips to "below threshold" when most of the slice is
+    bright: the output is cropped to the core's width, so a wide core can fill over 55% of the picture,
+    and that flip then made the mask the air around it (the core went black, depending on small shifts).
+    """
+    from core_stitch.segment import largest_component
+
+    thr = threshold if np.isfinite(threshold) else air + 50.0
+    raw = np.isfinite(image) & (image >= thr)
+    res = largest_component(raw)
+    if res.n_components == 0:
+        return np.isfinite(image) & (image > air + 30.0)
+    return res.mask
 
 
 def render_plan(
@@ -268,7 +303,7 @@ def render_plan(
         out = np.zeros(vol.shape, bool)
         for z in range(vol.shape[0]):
             if fp[z].any():
-                out[z] = _content_mask(vol[z], h.threshold, h.air) & fp[z]
+                out[z] = _core_slice(vol[z], h.threshold, h.air) & fp[z]
         return out
 
     ref_core = core(ref_vol, ref_fp, ref)
@@ -301,6 +336,7 @@ def render_plan(
         ref_pixel_mm=float(rimg.GetSpacing()[0]), moving_pixel_mm=float(mimg.GetSpacing()[0]),
         upsample_factor_moving=float(mimg.GetSpacing()[0] / rimg.GetSpacing()[0]),
         same_lattice=bool(same), placement=placement, snapped_to_pixel=bool(snapped),
+        orientation_diff_deg=float(plan.orientation_diff_deg),
         snap_residual_mm=snap_residual_mm,
         interpolation="nearest (voxels on reference lattice)" if snapped else interpolator,
         move_mm_bottom=[float(x) for x in move_mm], applied_move_mm=[float(x) for x in move],
@@ -341,8 +377,14 @@ def image_based_move_mm(
     top_uid: str | None,
     bottom_folder: Path | str,
     bottom_uid: str | None,
+    require_below: bool = False,
+    turn_top: bool = False,
+    turn_bottom: bool = False,
 ) -> tuple[float, float, float]:
     """Fallback start for scans whose headers are way off.
+
+    ``require_below=True`` forces the bottom half below the top half (the order is not searched).
+
 
     Runs the existing core-mask + overlap-profile alignment (``coarse_align``) and returns the
     shift of the *bottom* half from its header placement that reproduces that alignment, as
@@ -351,7 +393,8 @@ def image_based_move_mm(
     """
     from core_stitch.pipeline import coarse_align
 
-    st = coarse_align(top_folder, bottom_folder, top_uid, bottom_uid)
+    st = coarse_align(top_folder, bottom_folder, top_uid, bottom_uid, require_below=require_below,
+                      turn_a=turn_top, turn_b=turn_bottom)
     heads = []
     for series in (st.fixed.series, st.mobile_base.series):
         ds = pydicom.dcmread(series.slice_paths[0], stop_before_pixels=True, force=True)
@@ -380,12 +423,15 @@ class RefineOutcome:
 
 
 def _local(img: sitk.Image, direction: np.ndarray, origin: np.ndarray) -> sitk.Image:
-    """Same voxels, re-expressed in the reference frame: axes = (across, along, depth), identity direction.
+    """Same voxels, re-expressed in the reference frame: axes = (across, along, depth).
 
-    A translation found in this frame is directly (across, along, depth) in mm, whatever the scan's tilt.
+    A translation found in this frame is directly (across, along, depth) in mm.  The image keeps its own
+    orientation relative to the reference (identity for the reference itself; a small rotation for a half that was
+    cut in a plane a few degrees away), so the registration sees exactly the placement the stitch uses.
     """
     out = sitk.Image(img)
-    out.SetDirection((1.0, 0, 0, 0, 1.0, 0, 0, 0, 1.0))
+    d_img = np.asarray(img.GetDirection(), float).reshape(3, 3)
+    out.SetDirection(tuple(float(x) for x in (direction.T @ d_img).flatten()))
     out.SetOrigin(tuple(float(x) for x in direction.T @ (np.asarray(img.GetOrigin()) - origin)))
     return out
 

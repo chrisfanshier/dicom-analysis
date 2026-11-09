@@ -45,7 +45,18 @@ def sample(origin, px, nx, ny, nz, dz, shift=(0.0, 0.0, 0.0)):
     return x, y, z, np.rint(phantom(x, y, z)).astype(np.int16)
 
 
-def write_dicom(folder: Path, uid: str, vol: np.ndarray, origin, px: float, dz: float) -> None:
+def sample_tilted(origin, px, nx, ny, nz, dz, tilt_deg):
+    """Sample the phantom on a series whose rows run down -z but whose image plane is turned ``tilt_deg`` about z."""
+    a = np.radians(tilt_deg)
+    row, col, nrm = np.array([np.cos(a), np.sin(a), 0.0]), np.array([0.0, 0.0, -1.0]), np.array([-np.sin(a), np.cos(a), 0.0])
+    i = np.arange(nx)[None, None, :, None]
+    j = np.arange(ny)[None, :, None, None]
+    k = np.arange(nz)[:, None, None, None]
+    p = np.asarray(origin) + i * px * row + j * px * col + k * dz * nrm
+    return np.rint(phantom(p[..., 0], p[..., 1], p[..., 2])).astype(np.int16), [*row, *col], nrm
+
+
+def write_dicom(folder: Path, uid: str, vol: np.ndarray, origin, px: float, dz: float, iop=IOP, step=(0.0, 1.0, 0.0)) -> None:
     folder.mkdir(parents=True, exist_ok=True)
     study = generate_uid()
     for k in range(vol.shape[0]):
@@ -60,8 +71,8 @@ def write_dicom(folder: Path, uid: str, vol: np.ndarray, origin, px: float, dz: 
         ds.SeriesInstanceUID = uid
         ds.Modality = "CT"
         ds.InstanceNumber = k + 1
-        ds.ImageOrientationPatient = IOP
-        ds.ImagePositionPatient = [origin[0], origin[1] + k * dz, origin[2]]
+        ds.ImageOrientationPatient = list(iop)
+        ds.ImagePositionPatient = [origin[0] + k * dz * step[0], origin[1] + k * dz * step[1], origin[2] + k * dz * step[2]]
         ds.PixelSpacing = [px, px]
         ds.SliceThickness = dz
         ds.Rows, ds.Columns = vol.shape[1:]
@@ -80,7 +91,7 @@ class Rig:
     """Two overlapping halves of the phantom written to disk."""
 
     def __init__(self, tmp: Path, px_top=0.5, px_btm=0.4, btm_offset=(0.0, 0.0, 0.0), btm_header_error_z=0.0,
-                 btm_header_error_x=0.0, btm_header_error_y=0.0):
+                 btm_header_error_x=0.0, btm_header_error_y=0.0, btm_tilt_deg=0.0, btm_upside_down=False):
         self.dz = 2.0
         self.nz = 16
         self.top_origin = (-45.0, -15.0, 100.0)
@@ -90,13 +101,19 @@ class Rig:
         nx_top, nx_btm = int(round(90 / px_top)), int(round(90 / px_btm))
         *_, self.top = sample(self.top_origin, px_top, nx_top, n_top, self.nz, self.dz)
         # bottom data come from the true phantom at its true origin; the *header* may be wrong
-        *_, self.btm = sample(self.btm_origin, px_btm, nx_btm, n_btm, self.nz, self.dz)
+        if btm_tilt_deg:  # the bottom half is cut in a plane turned about the core's long axis
+            self.btm, self.btm_iop, self.btm_step = sample_tilted(self.btm_origin, px_btm, nx_btm, n_btm, self.nz, self.dz, btm_tilt_deg)
+        else:
+            *_, self.btm = sample(self.btm_origin, px_btm, nx_btm, n_btm, self.nz, self.dz)
+            self.btm_iop, self.btm_step = IOP, (0.0, 1.0, 0.0)
+        if btm_upside_down:  # this half was scanned upside down: its slices hold the picture turned 180 degrees
+            self.btm = np.ascontiguousarray(self.btm[:, ::-1, ::-1])
         hdr_btm = (self.btm_origin[0] + btm_header_error_x, self.btm_origin[1] + btm_header_error_y,
                    self.btm_origin[2] + btm_header_error_z)
         self.px_top, self.px_btm = px_top, px_btm
         self.top_dir, self.btm_dir = tmp / "top", tmp / "btm"
         write_dicom(self.top_dir, "1.2.3.4", self.top, self.top_origin, px_top, self.dz)
-        write_dicom(self.btm_dir, "1.2.3.5", self.btm, hdr_btm, px_btm, self.dz)
+        write_dicom(self.btm_dir, "1.2.3.5", self.btm, hdr_btm, px_btm, self.dz, iop=self.btm_iop, step=self.btm_step)
 
     def run(self, **kw):
         return stitch_pair(self.top_dir, "1.2.3.4", self.btm_dir, "1.2.3.5", **kw)
@@ -206,13 +223,26 @@ class ItkStitchPhantomTests(unittest.TestCase):
             self.assertAlmostEqual(across, 0.0, delta=1.0)
         self.assertAlmostEqual(starts[0], starts[1], delta=0.6)
 
+    def test_halves_cut_in_slightly_different_planes_are_joined_by_their_headers(self) -> None:
+        rig = Rig(self.dir, btm_tilt_deg=5.0)  # the bottom half's plane is turned 5 degrees about the core axis
+        res = rig.run()
+        self.assertAlmostEqual(res.info["orientation_diff_deg"], 5.0, places=2)
+        truth = truth_on_grid(res.grid)
+        sel = (truth > 600) & (res.volume > -1000)
+        self.assertGreater(int(sel.sum()), 20000)
+        err = np.abs(res.volume - truth)[sel]
+        self.assertLess(float(err.mean()), 20.0)  # every voxel sits where the headers say it is
+        # the reference half is untouched; the rotated half is resampled into its orientation
+        self.assertEqual(res.info["reference"], "bottom")
+
     def test_orientation_mismatch_is_refused(self) -> None:
         rig = Rig(self.dir)
         from core_stitch import itk_stitch
 
         top = load_half("top", rig.top_dir, "1.2.3.4")
         btm = load_half("bottom", rig.btm_dir, "1.2.3.5")
-        btm.col_dir = np.array([0.0, 0.1, -0.995])
+        btm.row_dir = np.array([0.0, 1.0, 0.0])  # a plane 90 degrees away: not the same view of the core
+        btm.col_dir = np.array([0.0, 0.0, -1.0])
         with self.assertRaises(ValueError):
             itk_stitch.stitch_pair(None, None, None, None, halves=(top, btm))
 

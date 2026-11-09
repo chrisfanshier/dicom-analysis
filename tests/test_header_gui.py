@@ -55,6 +55,20 @@ class HeaderStateTests(unittest.TestCase):
             self.assertEqual(chk["verdict"], "needs_image_stitch")
             self.assertTrue(chk["reasons"])
 
+    def test_refine_works_when_the_halves_are_cut_in_planes_a_few_degrees_apart(self) -> None:
+        # regression: refine used to ignore the tilt between the halves, scored a good join near zero and never found anything
+        with tempfile.TemporaryDirectory() as t:
+            rig = Rig(Path(t), btm_tilt_deg=3.0, btm_header_error_z=2.0, btm_header_error_x=1.5)
+            st = self._state(rig)
+            self.assertGreater(st.res.info["orientation_diff_deg"], 2.5)
+            out = st.refine()
+            self.assertTrue(out.applied, out.note)
+            self.assertGreater(out.score_before, 0.0)  # scored on the same placement the stitch uses
+            self.assertGreater(out.score_after, out.score_before)
+            self.assertGreater(st.join_correlation(), 0.97)
+            q = st.join_quality()
+            self.assertTrue(q["consistent"], q["flags"])  # and the join-quality check agrees it is now right
+
     def test_refine_recovers_a_small_header_error_along_and_across(self) -> None:
         with tempfile.TemporaryDirectory() as t:
             rig = Rig(Path(t), btm_header_error_z=2.0, btm_header_error_x=1.5)  # header puts the bottom half 2 mm high, 1.5 mm right
@@ -313,6 +327,111 @@ class HeaderGuiTests(unittest.TestCase):
         self.assertEqual(meta["engine"], "simpleitk_header_geometry")
         self.assertTrue(list(out.glob("dicom_mpr/*.dcm")))
         self.assertTrue(list(out.glob("*.jpg")))
+
+    def test_swap_and_straighten_checkboxes(self) -> None:
+        app = self.app
+        app.path_a, app.path_b = self.rig.top_dir, self.rig.btm_dir
+        app.uid_a, app.uid_b = "1.2.3.4", "1.2.3.5"
+        app.load_header_pair()
+        app.update()
+        self.assertFalse(app.single.swapped)
+        self.assertFalse(app.single.straighten)
+        # the Swap button re-orders the halves (TOP below the other) by image matching; a second click swaps back
+        with mock.patch("tkinter.messagebox.showwarning"):  # the phantom really is in the catalog order: a poor-match warning is expected
+            app.swap_top_bottom()
+        app.update()
+        self.assertTrue(app.single.swapped)
+        self.assertEqual(app.single.top.series.series_uid, "1.2.3.5")
+        self.assertIn("SWAPPED", app.swap_text.get())
+        app.swap_top_bottom()
+        self.assertFalse(app.single.swapped)
+        self.assertIn("as labelled", app.swap_text.get())
+        # straighten on a stitched pair is applied at export, not in the preview
+        app.straighten.set(True)
+        app._on_straighten()
+        self.assertTrue(app.single.straighten)
+        app.straighten.set(False)
+        app._on_straighten()
+        self.assertFalse(app.single.straighten)
+        # a new load takes the checkbox's current value
+        app.straighten.set(True)
+        app.load_header_pair()
+        self.assertTrue(app.single.straighten)
+
+    def test_straighten_checkbox_on_a_single_scan(self) -> None:
+        from types import SimpleNamespace
+
+        app = self.app
+        job = SimpleNamespace(a=SimpleNamespace(path=self.rig.top_dir, series_uid="1.2.3.4"), key="k")
+        app.load_single_job(job)
+        app.update()
+        st = app.single
+        self.assertEqual(st.kind, "single")
+        self.assertFalse(st.straighten)
+        before = st.half.image.copy()
+        app.straighten.set(True)
+        app._on_straighten()
+        app.update()
+        self.assertTrue(st.straighten)
+        app.straighten.set(False)
+        app._on_straighten()
+        self.assertTrue(np.array_equal(st.half.image, before))  # back to exactly the scanned values
+
+    def test_a_pair_cut_in_different_planes_still_loads_with_a_warning(self) -> None:
+        with tempfile.TemporaryDirectory() as t:
+            rig = Rig(Path(t), btm_tilt_deg=5.0)
+            app = self.app
+            app.path_a, app.path_b = rig.top_dir, rig.btm_dir
+            app.uid_a, app.uid_b = "1.2.3.4", "1.2.3.5"
+            app.load_header_pair()
+            app.update()
+            self.assertTrue(app._hdr_active())  # loaded anyway
+            self.assertIn("5.0 degrees apart", app.hdr_check.get())
+            with mock.patch("tkinter.messagebox.showwarning"):
+                app.swap_top_bottom()  # and the Swap button works on it
+            self.assertTrue(app.single.swapped)
+            self.assertFalse(app.hdr_info.get() == "")
+
+    def test_rotate_180_button_toggles_for_a_stitched_pair_and_keeps_the_turn_on_reload(self) -> None:
+        app = self.app
+        app.path_a, app.path_b = self.rig.top_dir, self.rig.btm_dir
+        app.uid_a, app.uid_b = "1.2.3.4", "1.2.3.5"
+        app.load_header_pair()
+        app.update()
+        plain = app.single.res.volume[0].copy()
+        app.toggle_upside_down()
+        app.update()
+        self.assertTrue(app.single.upside_down)
+        self.assertTrue(np.array_equal(app.single.res.volume[0], plain[::-1, ::-1]))
+        self.assertIn("TURNED", app.upside_text.get())
+        app.load_header_pair()  # reloading the same pair (as Swap does) keeps the picture turned
+        self.assertTrue(app.single.upside_down)
+        app.toggle_upside_down()
+        self.assertFalse(app.single.upside_down)
+        self.assertTrue(np.array_equal(app.single.res.volume[0], plain))
+
+    def test_turn_half_buttons_turn_one_series_and_place_by_the_images(self) -> None:
+        with tempfile.TemporaryDirectory() as t:
+            rig = Rig(Path(t), btm_upside_down=True, btm_header_error_z=40.0)
+            app = self.app
+            app.path_a, app.path_b = rig.top_dir, rig.btm_dir
+            app.uid_a, app.uid_b = "1.2.3.4", "1.2.3.5"
+            app.load_header_pair()
+            app.update()
+            self.assertFalse(app.single.bottom_turned)
+            with mock.patch("tkinter.messagebox.showwarning"):
+                app.turn_half("bottom")
+            app.update()
+            self.assertTrue(app.single.bottom_turned)
+            self.assertFalse(app.single.top_turned)
+            self.assertIn("image alignment", app.single.moved_by)
+            self.assertGreater(app.single.join_correlation(), 0.9)
+            self.assertIn("TURNED", app.turn_text.get())
+            self.assertIn("(turned 180 deg)", app.hdr_info.get())
+            app.turn_half("bottom")  # click again: undone, back at the scanner position
+            self.assertFalse(app.single.bottom_turned)
+            self.assertEqual(app.single.moved_by, "scanner header")
+            self.assertIn("Neither", app.turn_text.get())
 
 
 if __name__ == "__main__":

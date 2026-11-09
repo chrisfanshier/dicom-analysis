@@ -19,7 +19,7 @@ from core_stitch.geometry import (
     rotate_mask,
     shift_image,
 )
-from core_stitch.load import MprSeries, load_series
+from core_stitch.load import MprSeries, load_series, turned_series
 from core_stitch.overlap import (
     OverlapResult,
     alignment_rgb,
@@ -58,7 +58,8 @@ class HalfPrepared:
     geom: CoreGeometry
     target_mm: float
     air: float
-    upright_deg: float = 0.0  # CCW rotation applied to make long axis +row
+    upright_deg: float = 0.0  # CCW rotation applied to make long axis +row (0 if straightening was off)
+    tilt_deg: float = 0.0  # measured lean of the core axis from the row direction (+ = leans to larger columns going down)
     lateral_dcol: float = 0.0  # column shift after upright (px)
     seg_threshold: float = 0.0  # Otsu thr on native mid-slice (HU)
 
@@ -76,6 +77,7 @@ class StitchState:
     # Overlap pixel combine: max | mean | blend | feather | min | a | b
     fuse_mode: str = "max"
     match_hu: bool = False
+    require_below: bool = False  # the overlap search must put B below A (order fixed by hand)
     # Greyscale display/export window (HU); None → auto 1st–99th percentile
     window_lo: float | None = None
     window_hi: float | None = None
@@ -108,7 +110,7 @@ class StitchState:
 
 
 def _prepare_half(
-    series: MprSeries, target_mm: float, frame: int | None = None
+    series: MprSeries, target_mm: float, frame: int | None = None, *, straighten: bool = True
 ) -> tuple[HalfPrepared, list[str]]:
     warns: list[str] = []
     img0 = mid_slice(series.volume) if frame is None else series.volume[int(frame)]
@@ -123,12 +125,17 @@ def _prepare_half(
     mask = resample_mask_to_mm(seg.mask, (row_mm, col_mm), target_mm)
     geom = core_geometry(mask, target_mm)
 
-    # Rotate upright (long axis → +row)
+    # Rotate upright (long axis → +row).  The lean is always measured; the rotation (which interpolates
+    # every pixel) is applied only when asked for.
     ang = upright_angle(geom)
+    tilt = float(geom.angle_deg)
     air = air_value(image)
-    image = rotate_image(image, ang, cval=air, order=1)
-    mask = rotate_mask(mask, ang)
-    geom = core_geometry(mask, target_mm)
+    if straighten:
+        image = rotate_image(image, ang, cval=air, order=1)
+        mask = rotate_mask(mask, ang)
+        geom = core_geometry(mask, target_mm)
+    else:
+        ang = 0.0
 
     return (
         HalfPrepared(
@@ -139,6 +146,7 @@ def _prepare_half(
             target_mm=target_mm,
             air=air,
             upright_deg=ang,
+            tilt_deg=tilt,
             lateral_dcol=0.0,
             seg_threshold=float(seg.threshold),
         ),
@@ -151,14 +159,23 @@ def coarse_align(
     path_b: Path | str,
     uid_a: str | None = None,
     uid_b: str | None = None,
+    require_below: bool = False,
+    turn_a: bool = False,
+    turn_b: bool = False,
 ) -> StitchState:
     """Load A/B, resample, segment, upright, lateral-align B to A, run overlap.
+
+    ``require_below=True`` forces B below A (no search of the other order).
 
     ``uid_a`` / ``uid_b`` pick a series by SeriesInstanceUID when both parts sit
     in one folder (catalog ``parts_in_one_folder`` layout).
     """
     sa = load_series(path_a, uid_a)
     sb = load_series(path_b, uid_b)
+    if turn_a:  # a half scanned upside down: turn its slices around in place before anything else
+        sa = turned_series(sa)
+    if turn_b:
+        sb = turned_series(sb)
     target = float(
         min(sa.spacing_mm[1], sa.spacing_mm[2], sb.spacing_mm[1], sb.spacing_mm[2])
     )
@@ -185,7 +202,7 @@ def coarse_align(
         seg_threshold=mobile.seg_threshold,
     )
 
-    state = StitchState(fixed=fixed, mobile_base=mobile_base, warnings=warns)
+    state = StitchState(fixed=fixed, mobile_base=mobile_base, warnings=warns, require_below=bool(require_below))
     recompute_overlap(state)
     return state
 
@@ -331,6 +348,7 @@ def recompute_overlap(state: StitchState, *, reset_nudge: bool = True) -> Overla
         img_b,
         mask_b,
         spacing_mm=state.spacing_mm,
+        require_below=state.require_below,
     )
     state.overlap = result
     if reset_nudge:

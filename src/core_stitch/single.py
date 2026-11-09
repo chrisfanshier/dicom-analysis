@@ -6,6 +6,7 @@ Same crop-to-core, greyscale window and file products as the stitched export
 
 from __future__ import annotations
 
+import dataclasses
 import json
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -14,6 +15,8 @@ from pathlib import Path
 import numpy as np
 from PIL import Image
 
+from core_stitch.geometry import core_geometry
+from core_stitch.hu_tiff import write_hu_tiff
 from core_stitch.load import MprSeries, load_series
 from core_stitch.scale import auto_bounds, core_scale_block, dpi_for
 from core_stitch.pipeline import HalfPrepared, _prepare_half, core_crop_box, crop_to_box
@@ -27,6 +30,8 @@ class SingleState:
     window_lo: float | None = None
     window_hi: float | None = None
     warnings: list[str] = field(default_factory=list)
+    straighten: bool = False  # rotate the picture so the core is exactly vertical (interpolates every pixel)
+    upside_down: bool = False  # turn the picture 180 degrees (the core's top is at the bottom); lossless
 
     @property
     def n_frames(self) -> int:
@@ -41,6 +46,12 @@ class SingleState:
 
     def set_frame(self, frame: int) -> None:
         set_frame(self, frame)
+
+    def set_straighten(self, on: bool) -> None:
+        set_straighten(self, on)
+
+    def set_upside_down(self, on: bool) -> None:
+        set_upside_down(self, on)
 
     def auto_window(self) -> tuple[float, float]:
         return auto_window(self)
@@ -63,14 +74,14 @@ class SingleState:
 
 
 def prepare_single(
-    path: Path | str, series_uid: str | None = None, frame: int | None = None
+    path: Path | str, series_uid: str | None = None, frame: int | None = None, *, straighten: bool = False
 ) -> SingleState:
     series = load_series(path, series_uid)
     nz = int(series.volume.shape[0])
     f = nz // 2 if frame is None else int(np.clip(frame, 0, nz - 1))
     target = float(min(series.spacing_mm[1], series.spacing_mm[2]))
-    half, warns = _prepare_half(series, target, frame=f)
-    st = SingleState(series=series, half=half, frame=f, warnings=warns)
+    half, warns = _prepare_half(series, target, frame=f, straighten=straighten)
+    st = SingleState(series=series, half=half, frame=f, warnings=warns, straighten=bool(straighten))
     auto_window(st)
     return st
 
@@ -80,8 +91,36 @@ def set_frame(state: SingleState, frame: int) -> None:
     f = int(np.clip(frame, 0, nz - 1))
     if f == state.frame:
         return
-    half, warns = _prepare_half(state.series, state.spacing_mm, frame=f)
-    state.half, state.frame, state.warnings = half, f, warns
+    half, warns = _prepare_half(state.series, state.spacing_mm, frame=f, straighten=state.straighten)
+    state.half, state.frame, state.warnings = _turned(half, state.upside_down), f, warns
+
+
+def set_straighten(state: SingleState, on: bool) -> None:
+    """Switch the straightening rotation on or off and rebuild the current slice."""
+    on = bool(on)
+    if on == state.straighten:
+        return
+    state.straighten = on
+    half, warns = _prepare_half(state.series, state.spacing_mm, frame=state.frame, straighten=on)
+    state.half, state.warnings = _turned(half, state.upside_down), warns
+
+
+def _turned(half, upside_down: bool):
+    """The prepared half turned 180 degrees (rows and columns reversed) if the core is upside down.  Lossless."""
+    if not upside_down:
+        return half
+    image, mask = np.ascontiguousarray(half.image[::-1, ::-1]), np.ascontiguousarray(half.mask[::-1, ::-1])
+    return dataclasses.replace(half, image=image, mask=mask, geom=core_geometry(mask, half.target_mm))
+
+
+def set_upside_down(state: SingleState, on: bool) -> None:
+    """Turn the picture 180 degrees, or back.  Rebuilds the current slice from the scan."""
+    on = bool(on)
+    if on == state.upside_down:
+        return
+    state.upside_down = on
+    half, warns = _prepare_half(state.series, state.spacing_mm, frame=state.frame, straighten=state.straighten)
+    state.half, state.warnings = _turned(half, on), warns
 
 
 def auto_window(state: SingleState) -> tuple[float, float]:
@@ -118,9 +157,10 @@ def sidecar_single(state: SingleState) -> dict:
     s = state.series
     lo, hi = window_limits(state)
     return {
-        "version": "0.1.0",
+        "version": "0.2.0",
         "unstitched": True,
-        "series": {
+        # "scan", not "series": the worklist adds its own "series" block (catalog ids) and would overwrite this one
+        "scan": {
             "series_uid": s.series_uid,
             "series_description": s.series_description,
             "n_slices": state.n_frames,
@@ -128,7 +168,17 @@ def sidecar_single(state: SingleState) -> dict:
         },
         "target_mm": state.spacing_mm,
         "frame": state.frame,
-        "upright_deg": state.half.upright_deg,
+        "rotate_180": {
+            "applied": bool(state.upside_down),
+            "note": "The picture was turned 180 degrees (rows and columns reversed; no pixel value changed) because the core was upside down."
+                    if state.upside_down else None,
+        },
+        "straighten": {
+            "applied": bool(state.straighten),
+            "measured_tilt_deg": round(float(state.half.tilt_deg), 4),
+            "rotation_applied_deg": round(float(state.half.upright_deg), 4),
+            "interpolation": "linear (every pixel of the slice is resampled)" if state.straighten else None,
+        },
         "window_lo": lo,
         "window_hi": hi,
         "warnings": list(state.warnings),
@@ -190,12 +240,10 @@ def export_single(
         meta["export_tiff"] = p.name
         paths["tiff"] = p
         hu = crop_to_box(state.half.image, box)
-        hu_min = float(np.min(hu))
-        hu16 = np.clip(np.rint(hu - hu_min), 0, 65535).astype(np.uint16)
         p16 = out_dir / f"{stem}_hu.tif"
-        Image.fromarray(hu16).save(p16, format="TIFF", compression="tiff_lzw", dpi=dpi)
+        write_hu_tiff(p16, hu, dpi[0])
         meta["export_tiff_hu"] = p16.name
-        meta["export_tiff_hu_offset"] = hu_min
+        meta["export_tiff_hu_offset"] = 0.0  # signed 16-bit: the pixel value is the HU
         meta["export_tiff_hu_spacing_mm"] = state.spacing_mm
         paths["tiff_hu"] = p16
     if json_sidecar:

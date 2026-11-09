@@ -12,6 +12,7 @@ from PIL import Image
 from pydicom.dataset import Dataset, FileDataset, FileMetaDataset
 from pydicom.uid import ExplicitVRLittleEndian, generate_uid
 
+from core_stitch.hu_tiff import write_hu_tiff
 from core_stitch.overlap import fuse_preview
 from core_stitch.scale import auto_bounds, core_scale_block, dpi_for
 from core_stitch.pipeline import (
@@ -259,17 +260,12 @@ def export_accept(
         meta["export_tiff"] = tif_path.name
         paths["tiff"] = tif_path
 
-        # 16-bit storage of HU (offset so negatives fit uint16); recover: hu = px + offset
+        # signed 16-bit TIFF: the pixel value is the HU (no offset)
         hu = crop_to_box(fused_hu(state), box)
-        hu_min = float(np.min(hu))
-        hu16 = np.clip(np.rint(hu - hu_min), 0, 65535).astype(np.uint16)
         tif_hu = out_dir / f"{stem}_hu.tif"
-        Image.fromarray(hu16).save(
-            tif_hu, format="TIFF", compression="tiff_lzw",
-            dpi=(dpi_for(state.spacing_mm),) * 2,
-        )
+        write_hu_tiff(tif_hu, hu, dpi_for(state.spacing_mm))
         meta["export_tiff_hu"] = tif_hu.name
-        meta["export_tiff_hu_offset"] = hu_min
+        meta["export_tiff_hu_offset"] = 0.0
         meta["export_tiff_hu_spacing_mm"] = state.spacing_mm
         paths["tiff_hu"] = tif_hu
 

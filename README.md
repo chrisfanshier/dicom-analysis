@@ -49,7 +49,7 @@ scan groups as cruise -> core -> section. Release folder: `$CORE_STITCH_RELEASE`
 - A pair loads into the Align tab (series chosen by UID, so TOP and BTM in one folder
   work). A scan with only one view opens in the same window (no second window) with a note
   that only 1 view was found: set the window, place the core ends, then Export
-  (JPEG + 8-bit/16-bit HU TIFF + JSON, marked `unstitched`).
+  (JPEG + 8-bit TIFF + signed 16-bit HU TIFF (pixel value = HU) + JSON, marked `unstitched`).
 - Export writes to `<release>/ct_stitched/<cruise>/<core>/<section>/<plane>_<kind>/vNNN/`
   (a re-export of the same job is a new version).
 - Progress (todo / loaded / exported / skipped / problem, notes, every export) lives in
@@ -65,6 +65,7 @@ scan groups as cruise -> core -> section. Release folder: `$CORE_STITCH_RELEASE`
   in the worklist (`length vs list` column, "length compared" filter) and in
   `ct_stitch_status.csv`, so a cut-off can be chosen later.
   Field-by-field guide for users: [docs/sidecar-fields.md](docs/sidecar-fields.md).
+  How the stitches are made (plain-language summary and full technical description): [docs/methodology.md](docs/methodology.md).
 
 Tests: `python -m unittest discover -s tests`.
 

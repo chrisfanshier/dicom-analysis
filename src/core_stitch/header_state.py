@@ -12,6 +12,8 @@ import json
 from datetime import datetime, timezone
 from pathlib import Path
 
+import dataclasses
+
 import numpy as np
 import pydicom
 from scipy.ndimage import binary_erosion
@@ -20,7 +22,9 @@ from PIL import Image
 from pydicom.dataset import FileDataset, FileMetaDataset
 from pydicom.uid import ExplicitVRLittleEndian, generate_uid
 
+from core_stitch.geometry import core_geometry
 from core_stitch.header_check import header_check
+from core_stitch.hu_tiff import write_hu_tiff
 from core_stitch.overlap import alignment_rgb
 from core_stitch.itk_stitch import (
     Half,
@@ -55,6 +59,11 @@ class HeaderState:
         self.window_lo: float | None = None
         self.window_hi: float | None = None
         self.warnings: list[str] = []
+        self.swapped = False  # True when the catalog's TOP/BOTTOM labels were exchanged on load
+        self.top_turned = False  # the half in the TOP role was turned 180 degrees in place (scanned upside down)
+        self.bottom_turned = False
+        self.straighten = False  # rotate the finished stitch so the core is exactly vertical (at export)
+        self.upside_down = False  # turn the whole picture 180 degrees (the core's top is at the bottom); lossless
         self.check = header_check(top, bottom)
         self._replan()
         self.frame = self.plan.n_slices // 2
@@ -63,15 +72,37 @@ class HeaderState:
 
     # ----- construction -----
     @classmethod
-    def load(cls, top_dir, top_uid, bottom_dir, bottom_uid, placement: str = "whole_pixel") -> "HeaderState":
-        return cls(load_half("top", top_dir, top_uid), load_half("bottom", bottom_dir, bottom_uid), placement=placement)
+    def load(cls, top_dir, top_uid, bottom_dir, bottom_uid, placement: str = "whole_pixel", *, swapped: bool = False,
+             top_turned: bool = False, bottom_turned: bool = False) -> "HeaderState":
+        """``swapped=True``: the two series are labelled backwards, so the one given as TOP is treated as the bottom half.
+
+        ``top_turned`` / ``bottom_turned`` (for the series given as TOP / BOTTOM): that series was scanned upside down
+        relative to the other, so its slices are turned 180 degrees in place (lossless).  The header position then no
+        longer describes its content: place it with ``realign_from_image``.
+        """
+        specs = [(top_dir, top_uid, bool(top_turned)), (bottom_dir, bottom_uid, bool(bottom_turned))]
+        if swapped:
+            specs.reverse()
+        (td, tu, tt), (bd, bu, bt) = specs
+        st = cls(load_half("top", td, tu, turn180=tt), load_half("bottom", bd, bu, turn180=bt), placement=placement)
+        st.swapped = bool(swapped)
+        st.top_turned, st.bottom_turned = tt, bt
+        return st
 
     # ----- plan / render -----
     def _replan(self) -> None:
         self.plan = plan_stitch(self.top, self.bottom, move_mm=tuple(self.move_mm), placement=self.placement, crop_pad_mm=CROP_PAD_MM)
 
     def _render(self) -> None:
-        self.res: ItkStitch = render_plan(self.plan, trim_rows=TRIM_ROWS, z_keep=(self.frame, self.frame))
+        res = render_plan(self.plan, trim_rows=TRIM_ROWS, z_keep=(self.frame, self.frame))
+        self.res: ItkStitch = _rotate180_full(res) if self.upside_down else res
+
+    def set_upside_down(self, on: bool) -> None:
+        """Turn the whole picture 180 degrees (rows and columns reversed; no pixel value changes)."""
+        on = bool(on)
+        if on != self.upside_down:
+            self.upside_down = on
+            self._render()
 
     def set_move(self, along: float, across: float, depth: float, *, source: str | None = None, keep_refine: bool = False) -> None:
         self.move_mm = [float(along), float(across), float(depth)]
@@ -218,10 +249,11 @@ class HeaderState:
         return ("Both halves share a pixel size and whole-pixel placement is off: a sub-pixel refined shift resamples "
                 "the bottom half once (linear), which smooths it slightly.")
 
-    def realign_from_image(self) -> tuple[float, float, float]:
-        """Fallback: ask the old mask + profile alignment where the bottom half goes."""
+    def realign_from_image(self, require_below: bool = False) -> tuple[float, float, float]:
+        """Fallback: ask the mask + profile alignment where the bottom half goes (optionally forcing it below the top half)."""
         mv = image_based_move_mm(
-            self.top.series.path, self.top.series.series_uid, self.bottom.series.path, self.bottom.series.series_uid
+            self.top.series.path, self.top.series.series_uid, self.bottom.series.path, self.bottom.series.series_uid,
+            require_below=require_below, turn_top=self.top_turned, turn_bottom=self.bottom_turned,
         )
         self.set_move(*mv, source="image alignment (mask + profile)")
         return mv
@@ -291,10 +323,19 @@ class HeaderState:
         return rgb
 
     # ----- text for the GUI -----
+    def measured_tilt_deg(self) -> float:
+        """Lean of the core's long axis from straight down the rows on the current slice, in degrees."""
+        return _measured_tilt(self.res, 0, self.spacing_mm)
+
     def summary(self) -> str:
         i = self.res.info
         up = i["upsample_factor_moving"]
         lines = [
+            ("SWAPPED. " if self.swapped else "")
+            + f"TOP: {self.top.series.series_description.strip() or self.top.series.series_uid[-12:]}"
+            + (" (turned 180 deg)" if self.top_turned else "") + "  |  "
+            + f"BOTTOM: {self.bottom.series.series_description.strip() or self.bottom.series.series_uid[-12:]}"
+            + (" (turned 180 deg)" if self.bottom_turned else ""),
             f"Reference: {i['reference']} half ({i['ref_pixel_mm']:.3f} mm/px), kept as scanned.",
             (f"{i['moving'].capitalize()} half resampled once from {i['moving_pixel_mm']:.3f} to {i['ref_pixel_mm']:.3f} mm/px (x{up:.2f})."
              if abs(up - 1.0) > 1e-3 else
@@ -307,14 +348,24 @@ class HeaderState:
         c = self.join_correlation()
         if c == c:  # not NaN
             lines.append(f"Join correlation on this slice: {c:.4f} (higher = the halves agree better in the overlap).")
+        try:
+            t = self.measured_tilt_deg()
+            lines.append(
+                f"Core tilt {t:+.2f} deg: " + ("will be straightened when you export." if self.straighten
+                                              else "not straightened (tick 'Straighten the core' to rotate it upright on export).")
+            )
+        except Exception:
+            pass
         return "\n".join(lines)
 
     def check_text(self) -> tuple[str, bool]:
         c = self.check
         if c["verdict"] == "headers_good":
             ncc = c["ncc_at_header"]
-            return ("Scanner placement looks consistent" + (f" (profile correlation {ncc:.2f})." if ncc is not None else "."), True)
-        return ("Scanner placement is doubtful: " + "; ".join(c["reasons"]) + ". Adjust the shift or use Re-align from image.", False)
+            return ("Scanner placement looks consistent" + (f" (profile correlation {ncc:.2f})." if ncc is not None else ".")
+                    + "".join(" " + n for n in c.get("notes", [])), True)
+        return ("Scanner placement is doubtful: " + "; ".join(c["reasons"]) + ". Adjust the shift or use Re-align from image."
+                + "".join(" " + n for n in c.get("notes", [])), False)
 
 
 # ---------------------------------------------------------------------------- export
@@ -333,14 +384,15 @@ def write_header_dicom(full: ItkStitch, state: HeaderState, out_dir: Path, *, se
     grid = full.grid
     spacing = grid.GetSpacing()
     origin = np.asarray(grid.GetOrigin())
-    normal = ref.normal
+    dm = np.asarray(grid.GetDirection(), float).reshape(3, 3)  # columns: row direction, column direction, normal
+    row_dir, col_dir, normal = dm[:, 0], dm[:, 1], dm[:, 2]  # (rotated from the scan's if the stitch was straightened)
     series_uid = generate_uid()
     study_uid = str(getattr(tmpl, "StudyInstanceUID", None) or generate_uid())
     frame_uid = str(getattr(tmpl, "FrameOfReferenceUID", None) or generate_uid())  # same space as the scans
     lo, hi = state.window_limits()
     vol = np.clip(np.rint(full.volume), -32768, 32767).astype(np.int16)
     nz, rows, cols = vol.shape
-    iop = [float(x) for x in np.r_[ref.row_dir, ref.col_dir]]
+    iop = [float(x) for x in np.r_[row_dir, col_dir]]
     for k in range(nz):
         meta = FileMetaDataset()
         meta.MediaStorageSOPClassUID = getattr(tmpl, "SOPClassUID", "1.2.840.10008.5.1.4.1.1.2")
@@ -381,6 +433,86 @@ def write_header_dicom(full: ItkStitch, state: HeaderState, out_dir: Path, *, se
     return series_dir, series_uid
 
 
+def _measured_tilt(full: ItkStitch, frame: int, mm: float) -> float:
+    """Lean of the stitched core's long axis from the row direction, in degrees (+ = leans to larger columns going down)."""
+    mask = full.ref_core[frame] | full.mov_core[frame]
+    return float(core_geometry(mask, mm).angle_deg)
+
+
+def _straighten_full(full: ItkStitch, tilt_deg: float) -> ItkStitch:
+    """Rotate the stitched volume in its slice plane so the core runs exactly down the rows.
+
+    The output grid is the same grid turned about the through-stack axis, so the DICOM geometry stays exact
+    (only the in-plane direction vectors change).  Volume: linear interpolation; masks: nearest neighbour.
+    This is a second resampling of the moving half (the first put it on the reference grid).
+    """
+    g = full.grid
+    d = np.asarray(g.GetDirection(), float).reshape(3, 3)
+    e_i, e_j, n = d[:, 0], d[:, 1], d[:, 2]  # column-index direction, row-index direction (down the core), normal
+    sp = np.asarray(g.GetSpacing(), float)
+    th = np.radians(tilt_deg)
+    axis = np.cos(th) * sp[1] * e_j + np.sin(th) * sp[0] * e_i  # the core axis in mm
+    ej2 = axis / np.linalg.norm(axis)
+    ei2 = np.cross(ej2, n)
+    d2 = np.column_stack([ei2, ej2, n])
+    size = np.asarray(g.GetSize(), int)
+    corners = np.asarray([g.TransformIndexToPhysicalPoint((int(i), int(j), int(k)))
+                          for i in (0, size[0] - 1) for j in (0, size[1] - 1) for k in (0, size[2] - 1)])
+    o = np.asarray(g.GetOrigin(), float)
+    u = (corners - o) @ d2  # each corner along the new axes, mm
+    lo, hi = u.min(axis=0), u.max(axis=0)
+    new_size = [int(np.ceil((hi[a] - lo[a]) / sp[a] - 1e-6)) + 1 for a in range(3)]
+    ng = sitk.Image(new_size, sitk.sitkFloat32)
+    ng.SetSpacing(tuple(float(x) for x in sp))
+    ng.SetDirection(tuple(float(x) for x in d2.flatten()))
+    ng.SetOrigin(tuple(float(x) for x in o + d2 @ lo))
+    air = float(full.reference.air)
+
+    def put(arr: np.ndarray, *, linear: bool) -> np.ndarray:
+        img = sitk.GetImageFromArray(np.ascontiguousarray(arr, dtype=np.float32 if linear else np.uint8))
+        img.CopyInformation(g)
+        out = sitk.Resample(img, ng, sitk.Transform(), sitk.sitkLinear if linear else sitk.sitkNearestNeighbor,
+                            air if linear else 0, sitk.sitkFloat32 if linear else sitk.sitkUInt8)
+        return sitk.GetArrayFromImage(out)
+
+    empty = np.empty((0, 0, 0), np.float32)  # the per-half renderings are not rotated; do not leave stale copies
+    info = dict(full.info, straightened_by_deg=float(tilt_deg))
+    return dataclasses.replace(
+        full, volume=put(full.volume, linear=True), grid=ng, ref_vol=empty, mov_vol=empty,
+        ref_footprint=put(full.ref_footprint, linear=False).astype(bool), mov_footprint=put(full.mov_footprint, linear=False).astype(bool),
+        ref_core=put(full.ref_core, linear=False).astype(bool), mov_core=put(full.mov_core, linear=False).astype(bool), info=info,
+    )
+
+
+def _rotate180_full(full: ItkStitch) -> ItkStitch:
+    """Turn every slice 180 degrees in its own plane: rows and columns reversed.  Lossless.
+
+    The grid's row and column directions are negated and its origin moves to the opposite corner, so every
+    voxel keeps its true position in space (a DICOM stack written from it describes the same volume).
+    """
+    g = full.grid
+    d = np.asarray(g.GetDirection(), float).reshape(3, 3)
+    sp = np.asarray(g.GetSpacing(), float)
+    size = g.GetSize()  # (columns, rows, slices)
+    origin = np.asarray(g.GetOrigin(), float) + (size[0] - 1) * sp[0] * d[:, 0] + (size[1] - 1) * sp[1] * d[:, 1]
+    d2 = d.copy()
+    d2[:, 0] *= -1.0
+    d2[:, 1] *= -1.0
+    ng = sitk.Image(list(size), sitk.sitkFloat32)
+    ng.SetSpacing(tuple(float(x) for x in sp))
+    ng.SetDirection(tuple(float(x) for x in d2.flatten()))
+    ng.SetOrigin(tuple(float(x) for x in origin))
+
+    def rot(a: np.ndarray) -> np.ndarray:
+        return np.ascontiguousarray(a[:, ::-1, ::-1])
+
+    return dataclasses.replace(
+        full, volume=rot(full.volume), grid=ng, ref_vol=rot(full.ref_vol), mov_vol=rot(full.mov_vol),
+        ref_footprint=rot(full.ref_footprint), mov_footprint=rot(full.mov_footprint),
+        ref_core=rot(full.ref_core), mov_core=rot(full.mov_core), info=dict(full.info, rotated_180=True),
+    )
+
+
 def _rows_where(mask2d: np.ndarray) -> list[int] | None:
     r = np.where(mask2d.any(axis=1))[0]
     return None if r.size == 0 else [int(r[0]), int(r[-1])]
@@ -410,10 +542,13 @@ def sidecar_header(state: HeaderState, full: ItkStitch, frame: int, box) -> dict
         "engine": "simpleitk_header_geometry",
         "software": {"simpleitk": i["sitk_version"]},
         "stitched": True,
+        "top_bottom_swapped": bool(state.swapped),
         "top": {"series_uid": state.top.series.series_uid, "series_description": state.top.series.series_description,
-                "native_mm_per_px": float(state.top.spacing_xyz[0]), "slice_step_mm": float(state.top.spacing_xyz[2])},
+                "native_mm_per_px": float(state.top.spacing_xyz[0]), "slice_step_mm": float(state.top.spacing_xyz[2]),
+                "turned_180": bool(state.top_turned)},
         "bottom": {"series_uid": state.bottom.series.series_uid, "series_description": state.bottom.series.series_description,
-                   "native_mm_per_px": float(state.bottom.spacing_xyz[0]), "slice_step_mm": float(state.bottom.spacing_xyz[2])},
+                   "native_mm_per_px": float(state.bottom.spacing_xyz[0]), "slice_step_mm": float(state.bottom.spacing_xyz[2]),
+                   "turned_180": bool(state.bottom_turned)},
         "resolution": {
             "output_mm_per_px": px,
             "reference_half": i["reference"],
@@ -434,6 +569,8 @@ def sidecar_header(state: HeaderState, full: ItkStitch, frame: int, box) -> dict
             "verdict": c["verdict"], "reasons": list(c["reasons"]),
             "across_diff_mm": c["across_diff_mm"], "depth_diff_mm": c["depth_diff_mm"],
             "profile_correlation_at_header": c["ncc_at_header"],
+            "orientation_difference_deg": c.get("orientation_diff_deg") or 0.0,
+            "notes": list(c.get("notes", [])),
         },
         "join": {
             "overlap_rows_in_image": ov,
@@ -468,6 +605,13 @@ def export_header(
     out_dir.mkdir(parents=True, exist_ok=True)
     full = render_plan(state.plan, trim_rows=TRIM_ROWS)  # every slice
     frame = int(np.clip(state.frame, 0, full.volume.shape[0] - 1))
+    quality = _join_quality(full)  # of the stitch as rendered, before any rotation
+    tilt = _measured_tilt(full, frame, state.spacing_mm)
+    rotated = bool(state.straighten) and abs(tilt) > 1e-6
+    if rotated:
+        full = _straighten_full(full, tilt)
+    if state.upside_down:
+        full = _rotate180_full(full)
     mask = full.ref_core[frame] | full.mov_core[frame]
     pad_px = max(2, int(round(pad_mm / max(state.spacing_mm, 1e-6))))
     box = core_crop_box(mask, mask, pad_px=pad_px)
@@ -485,7 +629,20 @@ def export_header(
     meta["view_slice"] = frame
     meta["n_slices"] = int(full.volume.shape[0])
     meta["window_lo"], meta["window_hi"] = float(lo), float(hi)
-    meta["join_quality"] = _join_quality(full)
+    meta["join_quality"] = quality
+    meta["rotate_180"] = {
+        "applied": bool(state.upside_down),
+        "note": "The whole picture was turned 180 degrees (rows and columns reversed; no pixel value changed) because the "
+                "core was upside down. The DICOM orientation vectors follow, so every voxel keeps its true position."
+                if state.upside_down else None,
+    }
+    meta["straighten"] = {
+        "applied": bool(rotated),
+        "measured_tilt_deg": round(tilt, 4),
+        "rotation_applied_deg": round(-tilt, 4) if rotated else 0.0,
+        "interpolation": ("linear: the whole stitched volume was resampled once more, so the reference half's voxels "
+                          "are no longer exactly as scanned") if rotated else None,
+    }
     meta["export_jpeg_pad_mm"] = pad_mm
     meta["export_crop_box_r0r1c0c1"] = [int(x) for x in box]
     meta["export_shape_px"] = [int(gray.shape[0]), int(gray.shape[1])]
@@ -508,12 +665,10 @@ def export_header(
         Image.fromarray(gray).save(p, format="TIFF", compression="tiff_lzw", dpi=dpi)
         meta["export_tiff"] = p.name
         paths["tiff"] = p
-        hu_min = float(np.min(img))
-        hu16 = np.clip(np.rint(img - hu_min), 0, 65535).astype(np.uint16)
         p16 = out_dir / f"{stem}_hu.tif"
-        Image.fromarray(hu16).save(p16, format="TIFF", compression="tiff_lzw", dpi=dpi)
+        write_hu_tiff(p16, img, dpi[0])
         meta["export_tiff_hu"] = p16.name
-        meta["export_tiff_hu_offset"] = hu_min
+        meta["export_tiff_hu_offset"] = 0.0  # signed 16-bit: the pixel value is the HU
         meta["export_tiff_hu_spacing_mm"] = state.spacing_mm
         paths["tiff_hu"] = p16
     if dicom:

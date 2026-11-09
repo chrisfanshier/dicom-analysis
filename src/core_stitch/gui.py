@@ -59,6 +59,14 @@ class StitchGui(tk.Tk):
         self.single: SingleState | HeaderState | None = None
         self.mode_note = tk.StringVar(value="")
         self.use_scanner_geometry = tk.BooleanVar(value=True)
+        self.labels_swapped = False  # True while TOP and BOTTOM are exchanged (the Swap button toggles it)
+        self.swap_text = tk.StringVar(value="Using TOP and BOTTOM as labelled in the catalog.")
+        self.upside_flag = False  # True while the picture is turned 180 degrees (the Rotate button toggles it)
+        self.turn_a = False  # the series labelled TOP in the catalog was scanned upside down: turn it around in place
+        self.turn_b = False  # the same for the series labelled BTM
+        self.turn_text = tk.StringVar(value="Neither half turned.")
+        self.upside_text = tk.StringVar(value="Picture as scanned.")
+        self.straighten = tk.BooleanVar(value=False)  # rotate so the core is exactly vertical (interpolates pixels)
         self.hdr_along = tk.DoubleVar(value=0.0)
         self.hdr_across = tk.DoubleVar(value=0.0)
         self.hdr_depth = tk.DoubleVar(value=0.0)
@@ -169,7 +177,7 @@ class StitchGui(tk.Tk):
         nb.bind("<<NotebookTabChanged>>", self._on_tab_changed)
         self._on_tab_changed()
 
-        self._build_align_tab(tab_align)
+        self._build_align_tab(self._scrollable(tab_align))
         self._build_display_tab(tab_display)
         self._build_export_tab(tab_export)
 
@@ -211,6 +219,37 @@ class StitchGui(tk.Tk):
         self.canvas.bind("<ButtonRelease-1>", self._canvas_release)
         self.canvas.bind("<Motion>", self.guides.motion)
 
+    def _scrollable(self, tab: ttk.Frame) -> ttk.Frame:
+        """A vertically scrolling area inside ``tab``: the Align controls are taller than a small window."""
+        tab.rowconfigure(0, weight=1)
+        tab.columnconfigure(0, weight=1)
+        cv = tk.Canvas(tab, highlightthickness=0, borderwidth=0)
+        bar = ttk.Scrollbar(tab, orient=tk.VERTICAL, command=cv.yview)
+        cv.configure(yscrollcommand=bar.set)
+        cv.grid(row=0, column=0, sticky="nsew")
+        bar.grid(row=0, column=1, sticky="ns")
+        inner = ttk.Frame(cv)
+        win = cv.create_window((0, 0), window=inner, anchor="nw")
+        inner.bind("<Configure>", lambda _e: cv.configure(scrollregion=cv.bbox("all")))
+        cv.bind("<Configure>", lambda e: cv.itemconfigure(win, width=e.width))
+
+        def wheel(e: tk.Event) -> None:
+            if inner.winfo_reqheight() > cv.winfo_height():
+                cv.yview_scroll(-1 if e.delta > 0 else 1, "units")
+
+        def over(_e: tk.Event) -> None:
+            cv.bind_all("<MouseWheel>", wheel)
+
+        def away(e: tk.Event) -> None:
+            under = tab.winfo_containing(e.x_root, e.y_root)
+            if under is not None and str(under).startswith(str(tab)):
+                return  # still over the tab (moved onto a control)
+            cv.unbind_all("<MouseWheel>")
+
+        tab.bind("<Enter>", over)
+        tab.bind("<Leave>", away)
+        return inner
+
     def _build_align_tab(self, parent: ttk.Frame) -> None:
         parent.columnconfigure(0, weight=1)
         ttk.Label(
@@ -236,13 +275,55 @@ class StitchGui(tk.Tk):
             variable=self.use_scanner_geometry,
         ).pack(anchor=tk.W, pady=(0, 4))
         ttk.Button(parent, text="Load pair with scanner geometry", command=self.load_header_pair).pack(
-            fill=tk.X, pady=(0, 8)
+            fill=tk.X, pady=(0, 4)
         )
+        ttk.Button(parent, text="Swap TOP and BOTTOM (re-order the halves)", command=self.swap_top_bottom).pack(fill=tk.X)
+        ttk.Label(parent, textvariable=self.swap_text, wraplength=320, font=("", 8)).pack(anchor=tk.W, pady=(2, 0))
+        ttk.Label(
+            parent,
+            text="Use when the two series are labelled backwards but each is the right way up. The half labelled TOP "
+            "goes below the other and the join is found from the images (about a minute); the headers cannot place "
+            "them in that order. Click again to go back to the scanner positions. Recorded in the sidecar (top_bottom_swapped).",
+            wraplength=320, font=("", 8),
+        ).pack(anchor=tk.W, pady=(0, 6))
+        row = ttk.Frame(parent)
+        row.pack(fill=tk.X, pady=(0, 0))
+        ttk.Button(row, text="Turn TOP half 180\u00b0", command=lambda: self.turn_half("top")).pack(side=tk.LEFT, fill=tk.X, expand=True)
+        ttk.Button(row, text="Turn BOTTOM half 180\u00b0", command=lambda: self.turn_half("bottom")).pack(side=tk.LEFT, fill=tk.X, expand=True)
+        ttk.Label(parent, textvariable=self.turn_text, wraplength=320, font=("", 8)).pack(anchor=tk.W, pady=(2, 0))
+        ttk.Label(
+            parent,
+            text="Use when only one half was scanned upside down. That half is turned around in place (lossless) and "
+            "the join is then found from the images (about a minute). Click again to undo. Recorded in the sidecar (turned_180).",
+            wraplength=320, font=("", 8),
+        ).pack(anchor=tk.W, pady=(0, 6))
+        ttk.Button(parent, text="Rotate 180 degrees (core is upside down)", command=self.toggle_upside_down).pack(fill=tk.X)
+        ttk.Label(parent, textvariable=self.upside_text, wraplength=320, font=("", 8)).pack(anchor=tk.W, pady=(2, 0))
+        ttk.Label(
+            parent,
+            text="Use when the core's top is at the bottom of the picture. Turns the whole picture around "
+            "(top becomes bottom, left becomes right); no pixel value changes. Click again to undo. "
+            "Recorded in the sidecar (rotate_180).",
+            wraplength=320, font=("", 8),
+        ).pack(anchor=tk.W, pady=(0, 6))
+        ttk.Checkbutton(
+            parent,
+            text="Straighten the core (rotate the picture)",
+            variable=self.straighten,
+            command=self._on_straighten,
+        ).pack(anchor=tk.W)
+        ttk.Label(
+            parent,
+            text="Makes the core exactly vertical. This interpolates the pixels, so the values change slightly; "
+            "off keeps them as scanned. The measured tilt is recorded either way (sidecar: straighten). "
+            "For stitched pairs it is applied when you export.",
+            wraplength=320, font=("", 8),
+        ).pack(anchor=tk.W, pady=(0, 8))
         self._old_align = ttk.Frame(parent)
         self._hdr_align = ttk.Frame(parent)
         self._build_old_align(self._old_align)
         self._build_header_align(self._hdr_align)
-        self._set_align_mode("old")
+        self._set_align_mode("none")  # nothing loaded yet: show no alignment controls (the older ones appear only if used)
 
     def _set_align_mode(self, mode: str) -> None:
         """Show the controls for the current mode: older mask method, or scanner geometry."""
@@ -639,6 +720,129 @@ class StitchGui(tk.Tk):
 
     # ----- scanner-geometry (SimpleITK) stitch -----
 
+    def _set_upside(self, on: bool) -> None:
+        self.upside_flag = bool(on)
+        self.upside_text.set(
+            "TURNED 180 degrees: the whole picture is rotated around (lossless)." if self.upside_flag else "Picture as scanned."
+        )
+
+    def toggle_upside_down(self) -> None:
+        """Turn the whole picture 180 degrees, or back.  Instant and lossless."""
+        st = self.single
+        if st is None or self.state is not None:
+            messagebox.showinfo("Rotate 180 degrees", "Load a pair (scanner geometry) or a single scan first.")
+            return
+        on = not self.upside_flag
+        try:
+            st.set_upside_down(on)
+        except Exception as exc:
+            messagebox.showerror("Rotate 180 degrees", str(exc))
+            return
+        self._set_upside(on)
+        self.guides.reset()  # the end guides are measured on the picture as shown, so they start again
+        if isinstance(st, HeaderState):
+            self._hdr_sync()
+        self._sync_single_controls()
+        self._sync_window_from_state()
+        self._schedule_refresh()
+        self.status.set(
+            "Picture turned 180 degrees: the core's top end is now at the top of the picture. Place the end guides, then Export."
+            if on else "Picture back as scanned."
+        )
+
+    def _set_swapped(self, swapped: bool) -> None:
+        self.labels_swapped = bool(swapped)
+        self.swap_text.set(
+            "SWAPPED: the series labelled TOP in the catalog now sits BELOW the other (each half stays upright), "
+            "placed by image matching."
+            if self.labels_swapped else "Using TOP and BOTTOM as labelled in the catalog."
+        )
+
+    def swap_top_bottom(self) -> None:
+        """Reload the current pair with TOP and BOTTOM exchanged (and back again on the next click)."""
+        if not self.path_a or not self.path_b:
+            messagebox.showinfo("Swap TOP and BOTTOM", "Choose a pair from the Worklist first.")
+            return
+        self._set_swapped(not self.labels_swapped)
+        if not self._reload_and_place("Swapped" if self.labels_swapped else "Swapped back"):
+            self._set_swapped(not self.labels_swapped)  # the load failed: leave the label as it was
+
+    def _set_turned(self, a: bool, b: bool) -> None:
+        self.turn_a, self.turn_b = bool(a), bool(b)
+        parts = [n for n, f in (("the series labelled TOP in the catalog", self.turn_a), ("the series labelled BTM", self.turn_b)) if f]
+        self.turn_text.set(("TURNED 180 degrees in place: " + " and ".join(parts) + ".") if parts else "Neither half turned.")
+
+    def turn_half(self, role: str) -> None:
+        """Turn the half now in the TOP or BOTTOM role 180 degrees in place, or back, and re-place the pair by the images."""
+        if not self.path_a or not self.path_b:
+            messagebox.showinfo("Turn a half", "Choose a pair from the Worklist first.")
+            return
+        # the flags follow the series, so find which catalog series sits in that role now
+        is_a = (role == "top") != self.labels_swapped
+        before = (self.turn_a, self.turn_b)
+        if is_a:
+            self._set_turned(not self.turn_a, self.turn_b)
+        else:
+            self._set_turned(self.turn_a, not self.turn_b)
+        turning = (self.turn_a if is_a else self.turn_b)
+        if not self._reload_and_place(f"The {role} half is " + ("turned 180 degrees" if turning else "back as scanned")):
+            self._set_turned(*before)
+
+    def _reload_and_place(self, what: str) -> bool:
+        """Reload the current pair with the swap / turn settings, and place it: from the headers if the pair is as
+        scanned, otherwise by matching the images (the headers no longer describe a swapped or turned half)."""
+        before = self.single
+        self.load_header_pair()
+        if self.single is before:
+            return False  # the load failed
+        st = self.single
+        names = f"TOP is '{st.top.series.series_description.strip()}', BOTTOM is '{st.bottom.series.series_description.strip()}'."
+        if self.labels_swapped or self.turn_a or self.turn_b:
+            self.status.set(f"{what}. Placing the halves by image matching (about a minute)...")
+            self.update_idletasks()
+            # a swapped pair has its order fixed: the new bottom half goes below the new top half
+            ok = self._hdr_realign(require_below=self.labels_swapped)
+            self.status.set((f"{what}. " + names + " Placed by image matching; check the join.") if ok
+                            else f"{what}, but the image matching failed; the halves are still at their scanner positions.")
+            corr = self.single.join_correlation() if ok else float("nan")
+            if ok and corr == corr and corr < 0.8:
+                messagebox.showwarning(
+                    "Check the join",
+                    f"In this arrangement the two halves match poorly (join correlation {corr:.2f}).\n\n"
+                    "If the series are not really swapped or upside down, click the same button again to undo it.",
+                )
+        else:
+            self.status.set(f"{what}. " + names + " The halves are at their scanner positions.")
+        return True
+
+    def _on_straighten(self) -> None:
+        on = bool(self.straighten.get())
+        st = self.single
+        if st is None or self.state is not None:
+            return
+        if isinstance(st, HeaderState):
+            st.straighten = on  # a stitched pair is rotated once, when exporting
+            self._hdr_sync()  # the panel text states the tilt and whether it will be straightened
+            self.status.set(
+                "Straighten ON: the stitch will be rotated upright when you export (the preview itself is not rotated)." if on
+                else "Straighten OFF: the stitch will be exported as scanned."
+            )
+            return
+        try:
+            st.set_straighten(on)
+        except Exception as exc:
+            messagebox.showerror("Straighten", str(exc))
+            return
+        self.guides.reset()  # the rotated picture has a different size, so the end guides start again
+        self._sync_single_controls()
+        self._sync_window_from_state()
+        self._schedule_refresh()
+        note = f"Core tilt {st.half.tilt_deg:+.2f} deg: " + (
+            "STRAIGHTENED (the slice was rotated; pixels interpolated)." if on else "not straightened (pixels exactly as scanned)."
+        )
+        self.mode_note.set(note)
+        self.status.set(note)
+
     def _hdr_active(self) -> bool:
         return isinstance(self.single, HeaderState) and self.state is None
 
@@ -650,6 +854,9 @@ class StitchGui(tk.Tk):
             self.uid_a, self.uid_b = job.a.series_uid, job.b.series_uid
             self.path_a_var.set(str(job.a.path))
             self.path_b_var.set(str(job.b.path))
+            self._set_swapped(False)  # a newly chosen pair starts with the catalog's labels
+            self._set_upside(False)
+            self._set_turned(False, False)
         if not self.path_a or not self.path_b:
             messagebox.showinfo("Need folders", "Select both TOP and BTM series folders.")
             return
@@ -657,9 +864,14 @@ class StitchGui(tk.Tk):
         self.update_idletasks()
         placement = "whole_pixel" if self.hdr_whole_pixel.get() else "subpixel"
         try:
-            st = HeaderState.load(self.path_a, self.uid_a, self.path_b, self.uid_b, placement=placement)
+            st = HeaderState.load(
+                self.path_a, self.uid_a, self.path_b, self.uid_b, placement=placement, swapped=self.labels_swapped,
+                top_turned=self.turn_a, bottom_turned=self.turn_b,
+            )
+            st.straighten = bool(self.straighten.get())
+            st.set_upside_down(self.upside_flag)
         except Exception as exc:
-            messagebox.showerror("Scanner geometry", str(exc))
+            messagebox.showwarning("Scanner geometry not usable for this pair", str(exc))
             self.status.set(f"Load failed: {exc}")
             if job is not None:
                 self.current_job = None
@@ -825,22 +1037,23 @@ class StitchGui(tk.Tk):
         self.status.set("Refine undone.")
         self._schedule_refresh()
 
-    def _hdr_realign(self) -> None:
+    def _hdr_realign(self, require_below: bool = False) -> bool:
         if not self._hdr_active():
             messagebox.showinfo("Re-align", "Load a pair first.")
-            return
+            return False
         self.status.set("Re-aligning from the images (mask + profile)... this takes about a minute.")
         self.update_idletasks()
         try:
-            self.single.realign_from_image()
+            self.single.realign_from_image(require_below=require_below)
         except Exception as exc:
             messagebox.showerror("Re-align failed", str(exc))
             self.status.set(f"Re-align failed: {exc}")
-            return
+            return False
         self._hdr_sync()
         self._sync_single_controls()
         self.status.set("Placed from the image alignment. Check the join, then Export.")
         self._schedule_refresh()
+        return True
 
     def load_single_job(self, job) -> None:
         """A scan with only one view: same window, no join. Window, ends, then Export."""
@@ -848,7 +1061,11 @@ class StitchGui(tk.Tk):
         self.status.set("Loading single series...")
         self.update_idletasks()
         try:
-            st = prepare_single(job.a.path, job.a.series_uid)
+            st = prepare_single(job.a.path, job.a.series_uid, straighten=bool(self.straighten.get()))
+            self._set_upside(False)
+            self._single_tilt_note = f"Core tilt {st.half.tilt_deg:+.2f} deg: " + (
+                "STRAIGHTENED (pixels interpolated)." if st.straighten else "not straightened (pixels exactly as scanned)."
+            )
         except Exception as exc:
             messagebox.showerror("Single scan", str(exc))
             self.status.set(f"Single load failed: {exc}")
@@ -860,7 +1077,7 @@ class StitchGui(tk.Tk):
         self.path_b_var.set("")
         self.mode_note.set(
             "Only 1 view found in this scan, so there is nothing to stitch. "
-            "Set the window, place the core ends, then Export."
+            "Set the window, place the core ends, then Export. " + getattr(self, "_single_tilt_note", "")
         )
         self.guides.reset()
         self.zoom_var.set(1.0)

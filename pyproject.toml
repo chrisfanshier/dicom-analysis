@@ -19,6 +19,7 @@ dependencies = [
     "scikit-image>=0.22",
     "scipy>=1.11",
     "SimpleITK>=2.3",
+    "tifffile>=2023.1",
 ]
 
 [project.scripts]

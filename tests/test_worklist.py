@@ -309,7 +309,8 @@ class DicomTests(unittest.TestCase):
         meta = json.loads(paths["json"].read_text(encoding="utf-8"))
         self.assertTrue(meta["unstitched"])
         self.assertEqual(meta["job_key"], "k")
-        self.assertEqual(meta["series"]["series_uid"], "9.1")
+        self.assertEqual(meta["scan"]["series_uid"], "9.1")
+        self.assertEqual(meta["version"], "0.2.0")
 
 
 if __name__ == "__main__":

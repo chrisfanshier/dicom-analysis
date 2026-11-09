@@ -71,6 +71,7 @@ def search_overlap(
     ambiguous_ratio: float = 0.92,
     seed_overlap_frac: float = 0.18,
     refine_frac: float = 0.25,
+    require_below: bool = False,
 ) -> OverlapResult:
     """
     Search integer row shifts of B relative to A (B[0] at A[lag]).
@@ -107,6 +108,8 @@ def search_overlap(
 
     scores: list[tuple[float, int]] = []
     for lag in sorted(candidate_lags):
+        if require_below and lag <= 0:
+            continue  # B must start below A's start: the order is fixed (used when the halves were swapped by hand)
         aa0 = max(0, lag)
         bb0 = max(0, -lag)
         ov = min(len(pa) - aa0, len(pb) - bb0)

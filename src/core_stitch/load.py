@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import dataclasses
 import warnings
 from collections import defaultdict
 from dataclasses import dataclass
@@ -175,6 +176,15 @@ def select_uid_group(
     if not mine:
         raise FileNotFoundError(f"Series {series_uid} not found among {len(items)} files")
     return select_primary_group(mine)
+
+
+def turned_series(series: MprSeries) -> MprSeries:
+    """The same series with every slice turned 180 degrees about its own centre (rows and columns reversed).
+
+    Lossless: no value changes, only where it sits in the slice.  Used when one half was scanned upside down
+    relative to the other.  The header geometry is left as it was, so the content is turned in place.
+    """
+    return dataclasses.replace(series, volume=np.ascontiguousarray(series.volume[:, ::-1, ::-1]))
 
 
 def load_series(series_dir: Path | str, series_uid: str | None = None) -> MprSeries:

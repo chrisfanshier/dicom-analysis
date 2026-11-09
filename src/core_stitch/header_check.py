@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import numpy as np
 
+from core_stitch.itk_stitch import orientation_difference_deg
 from core_stitch.segment import mid_slice, segment_core
 
 ACROSS_TOL_MM = 5.0
@@ -27,7 +28,9 @@ def _profile(h):
     _, xs = np.nonzero(m)
     origin = np.asarray(h.image.GetOrigin())
     col_pitch, row_pitch = h.spacing_xyz[0], h.spacing_xyz[1]
-    across = float(np.dot(origin, h.row_dir)) + float(xs.mean() if xs.size else 0.0) * col_pitch
+    # where the core's centre column sits on this half's first slice plane (3-D, mm).  Measuring across and depth
+    # there, and not at the image corner, keeps halves cut in slightly different planes comparable.
+    across = origin + float(xs.mean() if xs.size else 0.0) * col_pitch * h.row_dir
     prof = np.full(m.shape[0], np.nan)
     for r in np.where(m.any(axis=1))[0]:
         prof[r] = img[r, m[r]].mean()
@@ -60,8 +63,8 @@ def header_check(top, bottom) -> dict:
     xb, zb, pb = _profile(bottom)
     out = {
         "orientations_equal": bool(np.allclose(np.r_[top.row_dir, top.col_dir], np.r_[bottom.row_dir, bottom.col_dir], atol=1e-3)),
-        "across_diff_mm": round(xb - xa, 2),
-        "depth_diff_mm": round(float(np.dot(np.asarray(bottom.image.GetOrigin()) - np.asarray(top.image.GetOrigin()), top.normal)), 2),
+        "across_diff_mm": round(float(np.dot(xb - xa, top.row_dir)), 2),
+        "depth_diff_mm": round(float(np.dot(xb - xa, top.normal)), 2),
     }
     g = np.arange(min(za.min(), zb.min()), max(za.max(), zb.max()), 1.0)
 
@@ -85,8 +88,14 @@ def header_check(top, bottom) -> dict:
     out["ncc_best"] = None if best_shift is None else round(best, 3)
 
     reasons = []
-    if not out["orientations_equal"]:
-        reasons.append("the two halves have different orientations")
+    out["orientation_diff_deg"] = None if out["orientations_equal"] else round(orientation_difference_deg(top, bottom), 2)
+    notes = []
+    if not out["orientations_equal"]:  # information, not a reason to doubt the placement: the headers describe both planes
+        notes.append(
+            f"The scanner cut the two halves in planes {out['orientation_diff_deg']:.1f} degrees apart; the coarser half is "
+            "resampled into the other's orientation."
+        )
+    out["notes"] = notes
     if abs(out["across_diff_mm"]) > ACROSS_TOL_MM:
         reasons.append(f"core centres are {out['across_diff_mm']:+.0f} mm apart sideways")
     if abs(out["depth_diff_mm"]) > DEPTH_TOL_MM:
