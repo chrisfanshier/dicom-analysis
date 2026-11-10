@@ -110,6 +110,7 @@ class WorklistPanel(ttk.Frame):
         )
         ttk.Button(top, text="Release…", width=9, command=self.choose_release).grid(row=0, column=1)
         ttk.Button(top, text="Reload", width=7, command=self.reload).grid(row=0, column=2, padx=(4, 0))
+        ttk.Button(top, text="Re-check exports", command=self.recheck_exports).grid(row=0, column=3, padx=(4, 0))
 
         flt = ttk.Frame(self)
         flt.grid(row=1, column=0, sticky="ew", pady=(4, 2))
@@ -264,6 +265,30 @@ class WorklistPanel(ttk.Frame):
             f"{cat.release_root} — {len(groups)} scan groups, {n_jobs} jobs"
         )
         self.populate()
+        self.recheck_exports(quiet=True)
+
+    def recheck_exports(self, quiet: bool = False) -> None:
+        """Compare the progress file with the export folders: a deleted export sets its job back to 'to do'.
+
+        Runs when a release is opened (silent unless something changed) and from the Re-check exports button.
+        """
+        if self.catalog is None or self.store is None:
+            return
+        if not self.catalog.release_root.is_dir():  # the release drive is not there: change nothing
+            if not quiet:
+                messagebox.showwarning("Re-check exports", f"Release folder not found:\n{self.catalog.release_root}")
+            return
+        try:
+            res = self.store.reconcile(self.catalog.export_root)
+        except Exception as exc:  # shown to the user, never silent
+            messagebox.showerror("Re-check exports", f"Could not check the exports:\n{exc}")
+            return
+        if res.changed:
+            self.populate()
+            self.write_csv()
+        self.app.status.set("Exports re-checked: " + res.text())
+        if res.changed or res.unrecorded_dirs or not quiet:
+            messagebox.showinfo("Re-check exports", res.text(), parent=self.app)
 
     def _restore_custom_jobs(self) -> None:
         """Re-create hand-made jobs saved in the progress store (matched by series UID)."""

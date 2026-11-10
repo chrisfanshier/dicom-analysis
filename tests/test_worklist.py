@@ -255,6 +255,74 @@ class ProgressTests(unittest.TestCase):
         self.assertEqual(rows[g.stitch_group]["status"], "exported")
         self.assertNotIn(untouched.stitch_group, rows)
 
+    def _export(self, job, version: int) -> Path:
+        out = self.cat.export_root / "CR1" / f"job_{abs(hash(job.key)) % 100000}" / f"v{version:03d}"
+        out.mkdir(parents=True)
+        (out / "x.json").write_text("{}", encoding="utf-8")
+        self.store.record_export(job, version, out, {"json": out / "x.json"})
+        return out
+
+    def test_reconcile_resets_job_when_export_folder_deleted(self) -> None:
+        import shutil
+
+        jobs = build_jobs(self.cat.groups["CR1|ctscan/A-1"])
+        out0 = self._export(jobs[0], 1)
+        self._export(jobs[1], 1)
+        res = self.store.reconcile(self.cat.export_root)
+        self.assertFalse(res.changed)
+        self.assertEqual((res.checked, res.unrecorded_dirs), (2, 0))
+        shutil.rmtree(out0)
+        res = self.store.reconcile(self.cat.export_root)
+        self.assertEqual(res.reset_jobs, [jobs[0].key])
+        self.assertEqual(self.store.status_of(jobs[0].key), "todo")
+        self.assertEqual(self.store.status_of(jobs[1].key), "exported")
+        self.assertIn("not found", self.store.note_of(jobs[0].key))
+        self.assertEqual(len(self.store.exports_of(jobs[0].key)), 1)  # history kept
+        self.assertEqual(self.store.next_version(jobs[0].key), 2)  # versions keep counting
+        self.assertFalse(self.store.reconcile(self.cat.export_root).changed)  # nothing more to do
+        # the folder comes back: the record is un-flagged (the status is left for the operator)
+        out0.mkdir(parents=True)
+        (out0 / "x.json").write_text("{}", encoding="utf-8")
+        self.assertEqual(self.store.reconcile(self.cat.export_root).restored, 1)
+
+    def test_reconcile_keeps_job_with_an_earlier_version_on_disk(self) -> None:
+        import shutil
+
+        j = build_jobs(self.cat.groups["CR1|ctscan/B-2"])[0]
+        self._export(j, 1)
+        out2 = self._export(j, 2)
+        shutil.rmtree(out2)
+        res = self.store.reconcile(self.cat.export_root)
+        self.assertEqual((res.missing, res.reset_jobs), (1, []))
+        self.assertEqual(self.store.status_of(j.key), "exported")
+
+    def test_reconcile_follows_a_moved_release_and_counts_unrecorded_folders(self) -> None:
+        j = build_jobs(self.cat.groups["CR1|ctscan/B-2"])[0]
+        out = self._export(j, 1)
+        # the same export was recorded under another drive letter / computer
+        self.store.con.execute("UPDATE export_run SET out_dir=?, files_json=?",
+                               ("Z:\\old_release\\ct_stitched\\CR1\\" + out.parent.name + "\\v001",
+                                '{"json": "Z:\\\\old_release\\\\ct_stitched\\\\CR1\\\\' + out.parent.name + '\\\\v001\\\\x.json"}'))
+        self.store.con.commit()
+        self.assertFalse(self.store.reconcile(self.cat.export_root).changed)
+        self.assertEqual(self.store.status_of(j.key), "exported")
+        (self.cat.export_root / "CR1" / "stray" / "v001").mkdir(parents=True)
+        self.assertEqual(self.store.reconcile(self.cat.export_root).unrecorded_dirs, 1)
+
+    def test_csv_shows_a_reset_job_as_todo(self) -> None:
+        import shutil
+
+        csv_path = Path(self.tmp.name) / "ct_stitch_status.csv"
+        g = self.cat.groups["CR1|ctscan/B-2"]
+        j = build_jobs(g)[0]
+        out = self._export(j, 1)
+        self.store.write_status_csv(csv_path, {g.stitch_group: [j.key]})
+        shutil.rmtree(out)
+        self.store.reconcile(self.cat.export_root)
+        self.store.write_status_csv(csv_path, {g.stitch_group: [j.key]})
+        rows = {r["stitch_group"]: r for r in csv.DictReader(csv_path.open(encoding="utf-8"))}
+        self.assertEqual(rows[g.stitch_group]["status"], "todo")
+
     def test_progress_survives_catalog_rebuild(self) -> None:
         j = build_jobs(self.cat.groups["CR1|ctscan/B-2"])[0]
         self.store.record_export(j, 1, self.root / "o", {})

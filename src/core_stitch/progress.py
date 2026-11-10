@@ -11,7 +11,9 @@ import csv
 import getpass
 import json
 import os
+import re
 import sqlite3
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -58,6 +60,52 @@ CREATE INDEX IF NOT EXISTS export_job ON export_run(job_key);
 """
 
 
+@dataclass
+class ReconcileResult:
+    """What ``ProgressStore.reconcile`` found when it compared the progress file with the export folders."""
+
+    checked: int = 0  # export records looked at
+    missing: int = 0  # records whose export folder (or all its files) is gone
+    restored: int = 0  # records that had been flagged missing but are back on disk
+    reset_jobs: list[str] = field(default_factory=list)  # job keys set back to 'todo'
+    unrecorded_dirs: int = 0  # vNNN folders under the export root that no record points at
+
+    @property
+    def changed(self) -> bool:
+        return bool(self.missing or self.restored or self.reset_jobs)
+
+    def text(self) -> str:
+        if not self.checked and not self.unrecorded_dirs:
+            return "No exports recorded yet."
+        parts = []
+        if self.reset_jobs:
+            parts.append(f"{len(self.reset_jobs)} job(s) set back to 'to do' because their export folder is gone")
+        elif self.missing:
+            parts.append(f"{self.missing} older export version(s) are gone, but those jobs still have a later one")
+        if self.restored:
+            parts.append(f"{self.restored} export(s) found on disk again")
+        if self.unrecorded_dirs:
+            parts.append(f"{self.unrecorded_dirs} export folder(s) on disk are not in the progress file (left alone)")
+        if not parts:
+            return f"All {self.checked} recorded export(s) are on disk."
+        return "; ".join(parts) + "."
+
+
+_VERSION_DIR = re.compile(r"^v\d{3,}$")
+
+
+def _resolve_export_path(p: str, export_root: Path) -> Path:
+    """``p`` if it exists, else re-rooted under ``export_root`` from its ``ct_stitched`` folder onwards."""
+    path = Path(p)
+    if path.exists():
+        return path
+    parts = path.parts
+    if "ct_stitched" in parts:
+        i = len(parts) - 1 - parts[::-1].index("ct_stitched")
+        return export_root.joinpath(*parts[i + 1:])
+    return path
+
+
 def current_user() -> str:
     try:
         return getpass.getuser()
@@ -91,6 +139,9 @@ class ProgressStore:
             ):
                 if col not in have:
                     self.con.execute(f"ALTER TABLE {table} ADD COLUMN {col} {typ}")
+        have = {r["name"] for r in self.con.execute("PRAGMA table_info(export_run)")}
+        if "missing" not in have:  # 1 = the export folder was not found at the last check (the record is kept)
+            self.con.execute("ALTER TABLE export_run ADD COLUMN missing INTEGER DEFAULT 0")
 
     def close(self) -> None:
         self.con.close()
@@ -208,6 +259,83 @@ class ProgressStore:
         )
         self.con.commit()
 
+    # ----- check the records against the disk ---------------------------------
+
+    @staticmethod
+    def _export_present(out_dir: str, files_json: str | None, export_root: Path) -> bool:
+        """True if the export folder exists and still holds at least one of its recorded files.
+
+        A recorded path that no longer exists (release moved to another drive or computer) is re-rooted under
+        ``export_root`` from its ``ct_stitched`` folder name onwards.
+        """
+        def resolve(p: str) -> Path:
+            return _resolve_export_path(p, export_root)
+
+        d = resolve(out_dir)
+        if not d.is_dir():
+            return False
+        try:
+            files = [v for v in json.loads(files_json or "{}").values() if v]
+        except (ValueError, AttributeError):
+            files = []
+        if not files:
+            return any(d.iterdir())  # nothing recorded: a non-empty folder counts
+        for f in files:
+            fp = Path(f)
+            if fp.is_absolute() or fp.parent != Path("."):
+                if resolve(f).exists():
+                    return True
+            elif (d / f).exists():
+                return True
+        return False
+
+    def reconcile(self, export_root: Path | str) -> ReconcileResult:
+        """Compare the export records with the export folders on disk.
+
+        A record whose folder (or every recorded file) is gone is flagged ``missing`` but kept, so the history and
+        version numbers stay. A job marked 'exported' with no export left on disk goes back to 'todo' (with a note);
+        a job that still has an earlier version on disk stays 'exported'. Folders on disk with no record are only
+        counted, never touched. Nothing on disk is changed.
+        """
+        root = Path(export_root)
+        res = ReconcileResult()
+        runs = list(self.con.execute("SELECT id, job_key, out_dir, files_json, missing FROM export_run"))
+        res.checked = len(runs)
+        present_by_job: dict[str, int] = {}
+        known_dirs: set[str] = set()
+        for r in runs:
+            ok = self._export_present(r["out_dir"], r["files_json"], root)
+            known_dirs.add(os.path.normcase(os.path.normpath(_resolve_export_path(r["out_dir"], root))))
+            if ok:
+                present_by_job[r["job_key"]] = present_by_job.get(r["job_key"], 0) + 1
+            if ok and r["missing"]:
+                res.restored += 1
+            elif not ok and not r["missing"]:
+                res.missing += 1
+            self.con.execute("UPDATE export_run SET missing=? WHERE id=?", (0 if ok else 1, r["id"]))
+        now = _now()
+        for r in self.con.execute("SELECT job_key, status, note FROM job WHERE status='exported'").fetchall():
+            if present_by_job.get(r["job_key"]):
+                continue
+            note = (r["note"] or "").strip()
+            added = f"export folder not found on {now[:10]}; set back to to do"
+            self.con.execute(
+                "UPDATE job SET status='todo', note=?, updated=?, length_check='', measured_cm=NULL,"
+                " expected_cm=NULL, length_diff_cm=NULL WHERE job_key=?",
+                ((note + "; " if note else "") + added, now, r["job_key"]),
+            )
+            res.reset_jobs.append(r["job_key"])
+        self.con.commit()
+        if root.is_dir():
+            for dirpath, dirnames, _files in os.walk(root):
+                for d in list(dirnames):
+                    if _VERSION_DIR.match(d):
+                        dirnames.remove(d)  # an export folder: do not look inside
+                        full = os.path.normcase(os.path.normpath(os.path.join(dirpath, d)))
+                        if full not in known_dirs:
+                            res.unrecorded_dirs += 1
+        return res
+
     # ----- group roll-up and CSV mirror -------------------------------------
 
     def group_status(self, job_keys: list[str]) -> str:
@@ -248,8 +376,8 @@ class ProgressStore:
             touched = any(self.con.execute(
                 "SELECT 1 FROM job WHERE job_key=? AND (status<>'todo' OR note<>'')", (k,)
             ).fetchone() for k in keys)
-            if status == "todo" and not touched:
-                continue
+            if status == "todo" and not touched and group not in existing:
+                continue  # (a group already in the file is still written, so a reset shows up there too)
             notes, last = [], ""
             for k in keys:
                 r = self.con.execute("SELECT note, updated, who FROM job WHERE job_key=?", (k,)).fetchone()
