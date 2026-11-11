@@ -22,6 +22,9 @@ dependencies = [
     "tifffile>=2023.1",
 ]
 
+[project.optional-dependencies]
+figures = ["matplotlib>=3.8"]  # tools/coronal_compare.py (the comparison figures)
+
 [project.scripts]
 core-stitch = "core_stitch.gui:main"
 core-stitch-cli = "core_stitch.cli:main"
