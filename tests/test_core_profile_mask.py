@@ -6,7 +6,7 @@ import unittest
 
 import numpy as np
 
-from core_profile.mask import auto_thresholds, circle_span, fit_axis_path, fit_outer_circle, mask_2d, mask_3d, ransac_circle, row_profile
+from core_profile.mask import auto_clast_threshold, auto_thresholds, circle_span, fit_axis_path, fit_outer_circle, mask_2d, mask_3d, ransac_circle, row_profile
 
 
 def round_core(shape=(60, 400, 120), seed=0):
@@ -101,6 +101,62 @@ def wobbly_tube(split: bool = False, nr: int = 300, seed: int = 0):
         vol[k][sed] = 800.0
         truth[k] = sed
     return vol + rng.normal(0, 15, vol.shape), truth, cx, cy
+
+
+class VoidAndClastTests(unittest.TestCase):
+    @staticmethod
+    def image():
+        img = np.full((80, 80), -1000.0)
+        img[5:75, 5:75] = 800.0
+        img[20:26, 20:26] = -1000.0  # an air pocket
+        img[50:58, 50:58] = 1600.0  # a dense clast
+        return img
+
+    def test_voids_stay_in_or_are_cut_out(self) -> None:
+        img = self.image()
+        kept = mask_2d(img, 300.0, 0, True)
+        cut = mask_2d(img, 300.0, 0, False)
+        self.assertTrue(kept[22, 22])
+        self.assertFalse(cut[22, 22])
+        self.assertTrue(cut[40, 40])
+
+    def test_clasts_are_cut_out_and_not_filled_back(self) -> None:
+        img = self.image()
+        m = mask_2d(img, 300.0, 0, True, None, 1200.0)
+        self.assertFalse(m[53, 53])  # the clast is out although fill_holes is on
+        self.assertTrue(m[22, 22])  # the air pocket is still filled in
+        self.assertTrue(m[40, 40])
+        self.assertEqual(int(mask_2d(img, 300.0, 0, True).sum() - m.sum()), 64)
+
+    def test_margin_also_shrinks_the_cut_outs(self) -> None:
+        img = self.image()
+        a = mask_2d(img, 300.0, 0, True, None, 1200.0)
+        b = mask_2d(img, 300.0, 2, True, None, 1200.0)
+        self.assertFalse(b[48, 53])  # two pixels away from the clast edge: the halo is gone too
+        self.assertTrue(a[48, 53])
+
+    def test_no_clast_threshold_changes_nothing(self) -> None:
+        vol, _ = round_core()
+        _, t_sed = auto_thresholds(vol)
+        np.testing.assert_array_equal(mask_3d(vol, t_sed, 1, 1.0), mask_3d(vol, t_sed, 1, 1.0, t_clast=None))
+
+    def test_clast_cut_works_with_the_cylinder_and_in_3d(self) -> None:
+        vol, truth = tube(False)
+        vol[:, 40:60, int(28 / DC) : int(32 / DC)] += np.where(truth[:, 40:60, int(28 / DC) : int(32 / DC)], 900.0, 0.0)  # dense patch
+        t_air, t_sed = auto_thresholds(vol)
+        circle = (CX, CY, R_OUT - WALL - 0.3)
+        a = mask_3d(vol, t_sed, 0, DC, circle=circle, dz_mm=DZ)
+        b = mask_3d(vol, t_sed, 0, DC, circle=circle, dz_mm=DZ, t_clast=1200.0)
+        self.assertLess(int(b.sum()), int(a.sum()))
+        self.assertFalse((b & (vol >= 1200.0)).any())
+
+    def test_auto_clast_threshold_sits_above_the_matrix_below_the_clasts(self) -> None:
+        rng = np.random.default_rng(0)
+        vol = np.full((20, 100, 100), -1000.0) + rng.normal(0, 10, (20, 100, 100))
+        vol[:, 10:90, 10:90] = 800.0 + rng.normal(0, 15, (20, 80, 80))
+        vol[5:8, 30:34, 30:34] = 1600.0
+        t = auto_clast_threshold(vol, 300.0)
+        self.assertTrue(840 < t < 1600, t)
 
 
 class AxisPathTests(unittest.TestCase):

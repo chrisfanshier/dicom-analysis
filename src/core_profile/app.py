@@ -22,7 +22,7 @@ from scipy import ndimage as ndi
 from core_stitch.load import MprSeries, load_series
 from core_stitch.scale import auto_bounds, clamp_insets
 
-from .mask import auto_thresholds, fit_axis_path, fit_outer_circle, mask_3d, mask_slice, row_profile
+from .mask import auto_clast_threshold, auto_thresholds, fit_axis_path, fit_outer_circle, mask_3d, mask_slice, row_profile
 
 pg.setConfigOptions(imageAxisOrder="row-major", antialias=False)
 
@@ -30,6 +30,7 @@ TOP_COLOR = "#22d3ee"  # same colours as the stitch window's guides
 BOTTOM_COLOR = "#f59e0b"
 DEPTH_COLOR = "#ffffff"
 MASK_COLOR = "#22c55e"
+CLAST_COLOR = "#e879f9"
 CIRCLE_COLOR = "#facc15"
 LINER_MM = 6.35  # a quarter-inch liner wall
 
@@ -284,6 +285,10 @@ class Viewer(QtWidgets.QMainWindow):
         self.t_line = pg.InfiniteLine(angle=90, movable=True, pen=pg.mkPen("#fb923c", width=2, style=QtCore.Qt.DashLine), hoverPen=pg.mkPen("#fb923c", width=4))
         self.t_line.sigPositionChanged.connect(self._threshold_dragged)
         self.hist.addItem(self.t_line)
+        self.c_line = pg.InfiniteLine(angle=90, movable=True, pen=pg.mkPen(CLAST_COLOR, width=2, style=QtCore.Qt.DashLine), hoverPen=pg.mkPen(CLAST_COLOR, width=4))
+        self.c_line.sigPositionChanged.connect(self._clast_dragged)
+        self.c_line.setVisible(False)
+        self.hist.addItem(self.c_line)
         v.addWidget(self.hist)
         self.black = SliderSpin("Black")
         self.white = SliderSpin("White")
@@ -350,17 +355,32 @@ class Viewer(QtWidgets.QMainWindow):
         row.addWidget(QtWidgets.QLabel("Shrink from edges"))
         row.addWidget(self.margin_spin, 1)
         v.addLayout(row)
-        self.fill_box = QtWidgets.QCheckBox("Fill holes (air pockets inside the sediment stay in the mask)")
-        self.fill_box.setChecked(True)
-        self.fill_box.toggled.connect(lambda _c: self._mask_params_changed())
+        self.void_box = QtWidgets.QCheckBox("Remove air / voids (below the orange line, inside the sediment)")
+        self.void_box.toggled.connect(lambda _c: self._mask_params_changed())
+        self.clast_box = QtWidgets.QCheckBox("Remove clasts / dense things (at or above the pink line)")
+        self.clast_box.toggled.connect(self._clast_toggled)
+        row_c = QtWidgets.QHBoxLayout()
+        self.c_spin = QtWidgets.QDoubleSpinBox()
+        self.c_spin.setDecimals(0)
+        self.c_spin.setRange(-5000, 20000)
+        self.c_spin.setSuffix(" HU")
+        self.c_spin.setKeyboardTracking(False)
+        self.c_spin.valueChanged.connect(self._clast_from_spin)
+        auto_c = QtWidgets.QPushButton("Auto")
+        auto_c.clicked.connect(self.auto_clast)
+        row_c.addWidget(QtWidgets.QLabel("Dense at or above"))
+        row_c.addWidget(self.c_spin, 1)
+        row_c.addWidget(auto_c)
         self.show_mask = QtWidgets.QCheckBox("Show mask (green)")
         self.show_mask.setChecked(True)
         self.show_mask.toggled.connect(self._mask_visible)
-        v.addWidget(self.fill_box)
+        v.addWidget(self.void_box)
+        v.addWidget(self.clast_box)
+        v.addLayout(row_c)
         v.addWidget(self.show_mask)
         self.mask_label = QtWidgets.QLabel("mask: -")
         v.addWidget(self.mask_label)
-        v.addWidget(self._hint("Drag the orange line on the histogram, or type a value. Per coronal slice the sediment is the biggest blob at or above it, so whole-round and split cores work alike. If the liner reads brighter than the sediment this one number cannot separate them."))
+        v.addWidget(self._hint("Drag the orange line on the histogram, or type a value. Per coronal slice the sediment is the biggest blob at or above it, so whole-round and split cores work alike. If the liner reads brighter than the sediment this one number cannot separate them. Remove air / voids and Remove clasts cut those voxels out of the mask (and the profile); both use one global level, so they work best on cores without a strong density trend."))
         col.addWidget(g)
 
         g, v = self._group("Core ends")
@@ -538,6 +558,12 @@ class Viewer(QtWidgets.QMainWindow):
         self.roi.setVisible(False)
         self.cyl_label.setText("")
         self._set_threshold(self.t_split, recompute=False)
+        self._busy = True
+        self.clast_box.setChecked(False)
+        self.void_box.setChecked(False)
+        self._busy = False
+        self.c_line.setVisible(False)
+        self._set_clast(auto_clast_threshold(s.volume, self.t_split), recompute=False)
         self.set_frame(nz // 2, first=True)
         self.zoom_fit()
         self.recompute_mask(sync=sync)
@@ -658,7 +684,8 @@ class Viewer(QtWidgets.QMainWindow):
         """Histogram x range: the greyscale range, widened so the orange threshold line is always on screen."""
         lo, hi = self.hist_range
         pad = 0.03 * (hi - lo)
-        self.hist.setXRange(min(lo, self.t_sed - pad), max(hi, self.t_sed + pad), padding=0)
+        ts = [self.t_sed] + ([self.t_clast] if self.clast_box.isChecked() else [])
+        self.hist.setXRange(min([lo] + [t - pad for t in ts]), max([hi] + [t + pad for t in ts]), padding=0)
 
     def _draw_histogram(self) -> None:
         lo, hi = self.hist_range
@@ -772,6 +799,33 @@ class Viewer(QtWidgets.QMainWindow):
             self.t_air, self.t_split = auto_thresholds(self.series.volume)
             self._set_threshold(self.t_split)
 
+    def _set_clast(self, t: float, recompute: bool = True) -> None:
+        was, self._busy = self._busy, True
+        self.t_clast = float(t)
+        self.c_spin.setValue(self.t_clast)
+        self.c_line.setValue(self.t_clast)
+        self._busy = was
+        self._hist_view()
+        if recompute and self.clast_box.isChecked():
+            self._mask_params_changed()
+
+    def _clast_from_spin(self, t: float) -> None:
+        if not self._busy:
+            self._set_clast(t)
+
+    def _clast_dragged(self) -> None:
+        if not self._busy:
+            self._set_clast(self.c_line.value())
+
+    def auto_clast(self) -> None:
+        if self.series is not None:
+            self._set_clast(auto_clast_threshold(self.series.volume, self.t_sed))
+
+    def _clast_toggled(self, on: bool) -> None:
+        self.c_line.setVisible(on)
+        self._hist_view()
+        self._mask_params_changed()
+
     def _mask_params_changed(self) -> None:
         """Quick: redraw this slice's mask now; the whole stack and the profile follow after a short pause."""
         if self.series is None or self._busy:
@@ -781,8 +835,10 @@ class Viewer(QtWidgets.QMainWindow):
         self._refresh_cor_mask()
         self._timer.start()
 
-    def _mask_args(self) -> tuple[float, float, bool, tuple[float, float, float] | None]:
-        return self.t_sed, self.margin_spin.value(), self.fill_box.isChecked(), self._circle()
+    def _mask_args(self) -> tuple:
+        """(sediment threshold, margin mm, fill holes, circle, clast threshold or None)."""
+        clast = self.t_clast if self.clast_box.isChecked() else None
+        return self.t_sed, self.margin_spin.value(), not self.void_box.isChecked(), self._circle(), clast
 
     def _refresh_cor_mask(self) -> None:
         if self.series is None:
@@ -790,8 +846,8 @@ class Viewer(QtWidgets.QMainWindow):
         if self.mask3d is not None:
             m = self.mask3d[self.frame]
         else:
-            t, margin, fill, circle = self._mask_args()
-            m = mask_slice(self.series.volume[self.frame], self.frame, t, margin, self.dz, self.dc, fill, circle)
+            t, margin, fill, circle, clast = self._mask_args()
+            m = mask_slice(self.series.volume[self.frame], self.frame, t, margin, self.dz, self.dc, fill, circle, clast)
         self.cor_mask.setImage(m, levels=(0, 1))
         self.cor_mask.setRect(QtCore.QRectF(0, 0, m.shape[1] * self.dc, m.shape[0] * self.dr))
         self.cor_mask.setVisible(self.show_mask.isChecked())
@@ -805,13 +861,13 @@ class Viewer(QtWidgets.QMainWindow):
         if self.series is None:
             return
         vol, dc = self.series.volume, self.dc
-        t, margin, fill, circle = self._mask_args()
+        t, margin, fill, circle, clast = self._mask_args()
         dz = self.dz
         self._mask_gen += 1
         gen = self._mask_gen
 
         def work():
-            m = mask_3d(vol, t, margin, dc, fill, circle, dz)
+            m = mask_3d(vol, t, margin, dc, fill, circle, dz, clast)
             return m, row_profile(vol, m)
 
         if sync:

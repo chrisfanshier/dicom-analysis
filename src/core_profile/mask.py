@@ -32,6 +32,19 @@ def auto_thresholds(volume: np.ndarray, max_samples: int = 2_000_000) -> tuple[f
     return t_air, t_sed
 
 
+def auto_clast_threshold(volume: np.ndarray, t_sed: float, max_samples: int = 2_000_000) -> float:
+    """A first guess for "dense": four robust standard deviations (1.4826 * MAD) above the median of everything at or
+    above the sediment threshold. A global number: it does not follow a density trend down the core."""
+    flat = volume.reshape(-1)
+    v = flat[:: max(1, flat.size // max_samples)]
+    v = v[np.isfinite(v) & (v >= t_sed)]
+    if v.size < 100:
+        return float(v.max()) if v.size else float(t_sed)
+    med = float(np.median(v))
+    mad = float(np.median(np.abs(v - med)))
+    return min(med + 4 * 1.4826 * max(mad, 1e-6), float(v.max()))
+
+
 MIN_BLOB_PX = 25  # smallest patch kept when a cylinder is used (about 6 mm2 at 0.5 mm pixels)
 
 
@@ -55,11 +68,15 @@ def circle_span(k: int, circle: tuple, dz_mm: float, dc_mm: float, n_cols: int) 
     return (int(c0), int(c1)) if int(c1) > int(c0) else None
 
 
-def mask_2d(img: np.ndarray, t_sed: float, margin_px: int = 1, fill_holes: bool = True, span: tuple | None = None) -> np.ndarray:
+def mask_2d(img: np.ndarray, t_sed: float, margin_px: int = 1, fill_holes: bool = True, span: tuple | None = None, t_clast: float | None = None) -> np.ndarray:
     """Sediment of one coronal slice. ``span`` = columns kept by a cylinder (everything outside is dropped first).
 
     Without a cylinder only the biggest blob is kept (the liner ties the sediment together); with one, every blob of
     at least MIN_BLOB_PX pixels is kept.
+
+    ``fill_holes``: air pockets enclosed by sediment stay in the mask (off = they are cut out). ``t_clast``: pixels at
+    or above it (clasts, shell, anything dense) are cut out. Both cut-outs are shrunk by the margin like any edge, and
+    the clast cut happens after the hole filling so a clast is not filled back in.
     """
     m = img >= t_sed
     if span is not None:  # (c0, c1): numbers, or one value per row
@@ -78,25 +95,27 @@ def mask_2d(img: np.ndarray, t_sed: float, margin_px: int = 1, fill_holes: bool 
             m = np.isin(lab, 1 + np.flatnonzero(sizes >= MIN_BLOB_PX))
     if fill_holes:
         m = ndi.binary_fill_holes(m)
+    if t_clast is not None:
+        m &= img < t_clast
     if margin_px > 0:
         m = ndi.binary_erosion(m, structure=ndi.generate_binary_structure(2, 1), iterations=margin_px, border_value=1)
     return m
 
 
-def mask_slice(img: np.ndarray, k: int, t_sed: float, margin_mm: float, dz_mm: float, dc_mm: float, fill_holes: bool = True, circle=None) -> np.ndarray:
+def mask_slice(img: np.ndarray, k: int, t_sed: float, margin_mm: float, dz_mm: float, dc_mm: float, fill_holes: bool = True, circle=None, t_clast: float | None = None) -> np.ndarray:
     """Mask of coronal slice ``k``: threshold, optionally inside the cylinder, biggest blob, holes, margin."""
     margin_px = int(round(margin_mm / dc_mm)) if margin_mm > 0 else 0
     if circle is None:
-        return mask_2d(img, t_sed, margin_px, fill_holes)
+        return mask_2d(img, t_sed, margin_px, fill_holes, None, t_clast)
     c0, c1 = circle_spans(k, circle, dz_mm, dc_mm, img.shape[1])
     if not (c1 > c0).any():
         return np.zeros(img.shape, bool)
-    return mask_2d(img, t_sed, margin_px, fill_holes, (c0, c1))
+    return mask_2d(img, t_sed, margin_px, fill_holes, (c0, c1), t_clast)
 
 
-def mask_3d(volume: np.ndarray, t_sed: float, margin_mm: float, pixel_mm: float, fill_holes: bool = True, circle=None, dz_mm: float = 1.0) -> np.ndarray:
+def mask_3d(volume: np.ndarray, t_sed: float, margin_mm: float, pixel_mm: float, fill_holes: bool = True, circle=None, dz_mm: float = 1.0, t_clast: float | None = None) -> np.ndarray:
     """Stack of per-coronal-slice masks, same shape as ``volume`` (slices, rows, cols)."""
-    return np.stack([mask_slice(volume[k], k, t_sed, margin_mm, dz_mm, pixel_mm, fill_holes, circle) for k in range(len(volume))])
+    return np.stack([mask_slice(volume[k], k, t_sed, margin_mm, dz_mm, pixel_mm, fill_holes, circle, t_clast) for k in range(len(volume))])
 
 
 # ---------------------------------------------------------------------------------------------------------

@@ -318,6 +318,37 @@ class ViewerTests(unittest.TestCase):
             w.close()
             w.deleteLater()
 
+    def test_void_and_clast_checkboxes_default_to_the_old_mask(self) -> None:
+        v = self.v
+        self.assertFalse(v.void_box.isChecked())
+        self.assertFalse(v.clast_box.isChecked())
+        self.assertFalse(v.c_line.isVisible())
+        self.assertEqual(v._mask_args()[2:5][0], True)  # fill holes on while "remove voids" is off
+        self.assertIsNone(v._mask_args()[4])
+        v.void_box.setChecked(True)
+        self.assertFalse(v._mask_args()[2])
+
+    def test_clast_line_box_and_cut(self) -> None:
+        v = self.v
+        a = int(v.mask3d.sum())
+        v.clast_box.setChecked(True)
+        self.assertTrue(v.c_line.isVisible())
+        self.assertAlmostEqual(v.c_spin.value(), v.c_line.value(), delta=1.0)
+        v.c_spin.setValue(820.0)  # the synthetic core: 800 above the middle, 848 below
+        self.assertAlmostEqual(v.c_line.value(), 820.0)
+        v.recompute_mask(sync=True)
+        self.assertLess(int(v.mask3d.sum()), a)
+        self.assertLess(float(np.nanmax(v.profile[0])), 830.0)  # the dense lower half is gone from the profile
+        x0, x1 = v.hist.viewRange()[0]
+        self.assertTrue(x0 <= 820.0 <= x1)
+        v.c_line.setValue(900.0)
+        self.assertAlmostEqual(v.c_spin.value(), 900.0)
+        v.auto_clast()
+        self.assertGreater(v.t_clast, v.t_sed)
+        v.clast_box.setChecked(False)
+        self.assertFalse(v.c_line.isVisible())
+        self.assertIsNone(v._mask_args()[4])
+
     def test_hide_guides(self) -> None:
         self.v.show_guides.setChecked(False)
         self.assertFalse(self.v.top_line.isVisible())
