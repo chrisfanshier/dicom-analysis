@@ -24,10 +24,13 @@ dependencies = [
 
 [project.optional-dependencies]
 figures = ["matplotlib>=3.8"]  # tools/coronal_compare.py (the comparison figures)
+profile = ["PySide6>=6.6", "pyqtgraph>=0.13"]  # core-profile app
 
 [project.scripts]
 core-stitch = "core_stitch.gui:main"
 core-stitch-cli = "core_stitch.cli:main"
+core-profile = "core_profile.app:main"
+core-profile-cli = "core_profile.cli:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]
