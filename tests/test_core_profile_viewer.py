@@ -301,6 +301,14 @@ class ViewerTests(unittest.TestCase):
             followed = w.cyl_label.text()
             w.recompute_mask(sync=True)
             n_follow = int(w.mask3d.sum())
+            out = Path(self.tmp.name) / "wobbly_profile.csv"
+            w.save_profile(out)
+            lines = out.read_text(encoding="utf-8").splitlines()
+            cols = [ln for ln in lines if not ln.startswith("#")][0].split(",")
+            self.assertEqual(cols[-2:], ["axis_x_mm", "axis_y_mm"])
+            first = [ln for ln in lines if not ln.startswith("#")][1].split(",")
+            r0 = int(round(float(first[0]) / w.dr - 0.5))
+            self.assertAlmostEqual(float(first[5]), float(w._path[0][r0]), delta=0.001)
             # dragging the circle sideways shifts the whole path
             x0 = w._circle()[0].copy()
             pos = w.roi.pos()
@@ -348,6 +356,57 @@ class ViewerTests(unittest.TestCase):
         v.clast_box.setChecked(False)
         self.assertFalse(v.c_line.isVisible())
         self.assertIsNone(v._mask_args()[4])
+
+    def test_save_profile_header_and_rows(self) -> None:
+        import json
+
+        v = self.v
+        v.clast_box.setChecked(True)
+        v.c_spin.setValue(820.0)
+        v.recompute_mask(sync=True)
+        out = Path(self.tmp.name) / "saved_profile.csv"
+        self.assertEqual(v.save_profile(out), out)
+        self.assertIn("Saved", v.save_label.text())
+        lines = out.read_text(encoding="utf-8").splitlines()
+        head = [ln for ln in lines if ln.startswith("#")]
+        meta = json.loads([ln for ln in head if ln.startswith("# settings_json: ")][0][len("# settings_json: "):])
+        self.assertEqual(meta["input"]["folder"], str(v.series.path))
+        self.assertEqual(meta["input"]["n_slices"], v.n_frames)
+        self.assertEqual(meta["mask"]["remove_clasts"], True)
+        self.assertAlmostEqual(meta["mask"]["clast_threshold_hu"], 820.0)
+        self.assertAlmostEqual(meta["mask"]["sediment_threshold_hu"], v.t_sed, delta=0.01)
+        self.assertEqual(meta["mask"]["cylinder"]["on"], False)
+        self.assertAlmostEqual(meta["core_ends"]["top_inset_cm"], v.top_cm, delta=0.001)
+        rows = [ln.split(",") for ln in lines if not ln.startswith("#")][1:]
+        lo, hi = v.top_cm * 10, (v.extent_cm - v.bottom_cm) * 10
+        self.assertTrue(all(lo <= float(r[0]) <= hi for r in rows))
+        r0 = int(round(float(rows[0][0]) / v.dr - 0.5))
+        self.assertAlmostEqual(float(rows[0][2]), float(v.profile[0][r0]), delta=0.01)
+
+    def test_save_profile_records_the_cylinder_and_axis(self) -> None:
+        import json
+
+        v = self.v
+        v._autofit_clicked()
+        v.recompute_mask(sync=True)
+        out = Path(self.tmp.name) / "cyl_profile.csv"
+        v.save_profile(out)
+        head = [ln for ln in out.read_text(encoding="utf-8").splitlines() if ln.startswith("# settings_json: ")]
+        cyl = json.loads(head[0][len("# settings_json: "):])["mask"]["cylinder"]
+        self.assertTrue(cyl["on"])
+        self.assertAlmostEqual(cyl["radius_mm"], v._circle()[2], delta=0.01)
+        self.assertEqual(cyl["follow_axis"], False)
+        self.assertAlmostEqual(cyl["liner_wall_mm"], 6.35)
+        cols = [ln for ln in out.read_text(encoding="utf-8").splitlines() if not ln.startswith("#")][0]
+        self.assertNotIn("axis_x_mm", cols)  # a fixed circle needs no per-row axis
+
+    def test_save_waits_for_the_mask(self) -> None:
+        v = self.v
+        v.margin_spin.setValue(3.0)  # the stack mask is stale until the pause is over
+        self.assertIsNone(v.mask3d)
+        self.assertIsNone(v.save_profile(Path(self.tmp.name) / "nope.csv"))
+        self.assertIn("still being computed", v.save_label.text())
+        self.assertFalse((Path(self.tmp.name) / "nope.csv").exists())
 
     def test_hide_guides(self) -> None:
         self.v.show_guides.setChecked(False)

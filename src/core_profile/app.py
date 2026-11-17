@@ -13,6 +13,7 @@ so the axial picture is interpolated across the stack for display only.
 from __future__ import annotations
 
 import sys
+from pathlib import Path
 
 import numpy as np
 import pyqtgraph as pg
@@ -22,7 +23,8 @@ from scipy import ndimage as ndi
 from core_stitch.load import MprSeries, load_series
 from core_stitch.scale import auto_bounds, clamp_insets
 
-from .mask import auto_clast_threshold, auto_thresholds, fit_axis_path, fit_outer_circle, mask_3d, mask_slice, row_profile
+from .export import write_profile_csv
+from .mask import MIN_BLOB_PX, MIN_ROW_VOXELS, auto_clast_threshold, auto_thresholds, fit_axis_path, fit_outer_circle, mask_3d, mask_slice, row_profile
 
 pg.setConfigOptions(imageAxisOrder="row-major", antialias=False)
 
@@ -418,6 +420,15 @@ class Viewer(QtWidgets.QMainWindow):
         self.len_label = QtWidgets.QLabel("Core length: -")
         v.addWidget(self.len_label)
         v.addWidget(self._hint("Insets are measured in from the top and bottom of the image, as in the stitch window."))
+        col.addWidget(g)
+        g, v = self._group("Profile")
+        save = QtWidgets.QPushButton("Save profile (CSV)...")
+        save.clicked.connect(lambda: self.save_profile())
+        v.addWidget(save)
+        self.save_label = QtWidgets.QLabel("")
+        self.save_label.setWordWrap(True)
+        v.addWidget(self.save_label)
+        v.addWidget(self._hint("One line per row between the core-end guides, with a commented header holding the input file and every setting above."))
         col.addWidget(g)
         col.addStretch(1)
 
@@ -891,6 +902,89 @@ class Viewer(QtWidgets.QMainWindow):
         self.mask_label.setText(f"mask: {100 * self.mask3d.mean():.1f}% of the volume, {int(cnt.max())} voxels in the fullest row")
         self._refresh_cor_mask()
         self._refresh_axial()
+
+    # ------------------------------------------------------------------ export
+    def profile_meta(self) -> dict:
+        """Everything that defines the profile: the input file and every choice, as nested plain values."""
+        import datetime
+        from importlib import metadata
+
+        s = self.series
+        try:
+            version = "core-stitch " + metadata.version("core-stitch")
+        except metadata.PackageNotFoundError:
+            version = "core-stitch (unknown version)"
+        circle = self._circle_any() if self._roi_ready else None
+        on = self.cyl_box.isChecked() and self._roi_ready
+        cyl: dict = {"on": on, "liner_wall_mm": round(self.liner_spin.value(), 3)}
+        if on:
+            cyl["radius_mm"] = round(circle[2], 3)
+            cyl["follow_axis"] = self._path is not None
+            if self._path is None:
+                cyl["centre_across_mm"], cyl["centre_along_stack_mm"] = round(circle[0], 3), round(circle[1], 3)
+            else:
+                cyl["axis_offset_dragged_mm"] = [round(self._off[0], 3), round(self._off[1], 3)]
+                cyl["axis_range_across_mm"] = round(float(np.ptp(self._path[0])), 3)
+                cyl["axis_range_along_stack_mm"] = round(float(np.ptp(self._path[1])), 3)
+            cyl["air_threshold_used_for_fit_hu"] = round(self.t_air, 2)
+        return {
+            "saved_utc": datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+            "software": "core-profile viewer, " + version,
+            "input": {
+                "folder": str(s.path),
+                "series_description": s.series_description,
+                "series_uid": s.series_uid,
+                "n_slices": int(s.volume.shape[0]),
+                "rows": int(s.volume.shape[1]),
+                "cols": int(s.volume.shape[2]),
+                "slice_spacing_mm": round(self.dz, 4),
+                "row_spacing_mm": round(self.dr, 4),
+                "col_spacing_mm": round(self.dc, 4),
+                "units": "HU",
+            },
+            "core_ends": {
+                "top_inset_cm": round(self.top_cm, 3),
+                "bottom_inset_cm": round(self.bottom_cm, 3),
+                "set_by": self.bounds_source,
+                "core_length_cm": round(self.extent_cm - self.top_cm - self.bottom_cm, 3),
+                "image_length_cm": round(self.extent_cm, 3),
+            },
+            "mask": {
+                "sediment_threshold_hu": round(self.t_sed, 2),
+                "rule": "per coronal slice: pixels at or above the threshold" + (" inside the cylinder; patches of at least %d pixels" % MIN_BLOB_PX if on else "; biggest blob only"),
+                "shrink_from_edges_mm": round(self.margin_spin.value(), 3),
+                "remove_air_voids": self.void_box.isChecked(),
+                "remove_clasts": self.clast_box.isChecked(),
+                "clast_threshold_hu": round(self.t_clast, 2) if self.clast_box.isChecked() else None,
+                "cylinder": cyl,
+            },
+            "profile": {
+                "statistic": "mean and SD of masked voxels per row, over all coronal slices",
+                "min_voxels_per_row": MIN_ROW_VOXELS,
+            },
+        }
+
+    def save_profile(self, path: str | Path | None = None) -> Path | None:
+        """Write the profile CSV (header with input and settings, then one line per row between the core ends)."""
+        if self.series is None or self.profile is None or self.mask3d is None:
+            self.save_label.setText("Nothing to save yet: the mask is still being computed (wait for it, then try again).")
+            return None
+        if path is None:
+            default = self.series.path.parent / f"{self.series.path.name}_profile.csv"
+            path, _ = QtWidgets.QFileDialog.getSaveFileName(self, "Save profile", str(default), "CSV (*.csv)")
+            if not path:
+                return None
+        mean, sd, cnt = self.profile
+        axis = None
+        if self._path is not None and self.cyl_box.isChecked():
+            axis = (self._path[0] + self._off[0], self._path[1] + self._off[1])
+        try:
+            n = write_profile_csv(path, mean, sd, cnt, self.dr, self.top_cm * 10, (self.extent_cm - self.bottom_cm) * 10, self.profile_meta(), axis)
+        except OSError as e:
+            self.save_label.setText(f"Could not save: {e}")
+            return None
+        self.save_label.setText(f"Saved {n} rows to {path}")
+        return Path(path)
 
     # ------------------------------------------------------------------ cylinder
     def _circle(self) -> tuple[float, float, float] | None:

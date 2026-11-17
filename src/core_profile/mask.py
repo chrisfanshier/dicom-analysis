@@ -45,6 +45,7 @@ def auto_clast_threshold(volume: np.ndarray, t_sed: float, max_samples: int = 2_
     return min(med + 4 * 1.4826 * max(mad, 1e-6), float(v.max()))
 
 
+MIN_ROW_VOXELS = 20  # a row with fewer masked voxels than this has no profile value
 MIN_BLOB_PX = 25  # smallest patch kept when a cylinder is used (about 6 mm2 at 0.5 mm pixels)
 
 
@@ -255,7 +256,7 @@ def fit_axis_path(volume: np.ndarray, t_air: float, dz_mm: float, dr_mm: float, 
     return cx_r, cy_r, r_med, len(rows)
 
 
-def row_profile(volume: np.ndarray, mask: np.ndarray, min_count: int = 20) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+def row_profile(volume: np.ndarray, mask: np.ndarray, min_count: int = MIN_ROW_VOXELS) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     """Mean, SD and voxel count per row (depth) over every masked voxel of every slice. NaN where fewer than ``min_count``."""
     cnt = mask.sum(axis=(0, 2))
     s1 = (volume * mask).sum(axis=(0, 2), dtype=np.float64)
