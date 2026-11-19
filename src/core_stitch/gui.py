@@ -139,15 +139,15 @@ class StitchGui(tk.Tk):
     def _build(self) -> None:
         self._hist_drag_which: str | None = None
 
-        root = ttk.Frame(self)
+        # The controls (left) and the image (right) share the window 50/50; the divider between them can be dragged.
+        root = ttk.PanedWindow(self, orient=tk.HORIZONTAL)
         root.pack(fill=tk.BOTH, expand=True)
-        root.columnconfigure(1, weight=1)
-        root.rowconfigure(0, weight=1)
+        self._pane = root
 
         # ----- Left control rail -----
-        left = ttk.Frame(root, padding=(8, 8, 4, 4), width=360)
-        left.grid(row=0, column=0, sticky="nsw")
-        left.grid_propagate(False)
+        left = ttk.Frame(root, padding=(8, 8, 4, 4), width=600)
+        root.add(left, weight=1)
+        left.grid_propagate(False)  # the divider, not the controls' own size, sets the width
         left.columnconfigure(0, weight=1)
         left.rowconfigure(1, weight=1)
 
@@ -185,8 +185,8 @@ class StitchGui(tk.Tk):
         )
 
         # ----- Right image pane -----
-        canvas_frame = ttk.Frame(root, padding=(4, 8, 8, 8))
-        canvas_frame.grid(row=0, column=1, sticky="nsew")
+        canvas_frame = ttk.Frame(root, padding=(4, 8, 8, 8), width=600)
+        root.add(canvas_frame, weight=1)
         canvas_frame.rowconfigure(0, weight=1)
         canvas_frame.columnconfigure(0, weight=1)
 
@@ -217,6 +217,49 @@ class StitchGui(tk.Tk):
         self.canvas.bind("<B1-Motion>", self._canvas_drag)
         self.canvas.bind("<ButtonRelease-1>", self._canvas_release)
         self.canvas.bind("<Motion>", self.guides.motion)
+
+        # text in the left panel wraps to the panel's width (so nothing is cut off), and the divider starts at 50%
+        self._wrap_labels: list = []
+        left.bind("<Configure>", self._rewrap_left)
+        self._sash_placed = False
+        root.bind("<Configure>", self._place_sash)
+        self.after(300, self._collect_wrap_labels)
+
+    def _collect_wrap_labels(self) -> None:
+        """Remember every label in the left panel that wraps its text, so it can follow the panel's width."""
+        found: list = []
+
+        def walk(w: tk.Misc) -> None:
+            for c in w.winfo_children():
+                if isinstance(c, (ttk.Label, tk.Label)) and not getattr(c, "_own_wrap", False):
+                    try:
+                        if int(str(c.cget("wraplength")) or 0) > 0:
+                            found.append(c)
+                    except (tk.TclError, ValueError):
+                        pass
+                walk(c)
+
+        walk(self._left)
+        self._wrap_labels = found
+        self._rewrap_left()
+
+    def _rewrap_left(self, _event=None) -> None:
+        width = max(220, self._left.winfo_width() - 56)  # room for the scrollbar and padding
+        for lab in self._wrap_labels:
+            try:
+                lab.configure(wraplength=width)
+            except tk.TclError:
+                pass
+
+    def _place_sash(self, _event=None) -> None:
+        """Put the divider at the middle of the window once, when the window first has its real size."""
+        if self._sash_placed or self._pane.winfo_width() < 400:
+            return
+        self._sash_placed = True
+        try:
+            self._pane.sashpos(0, self._pane.winfo_width() // 2)
+        except tk.TclError:
+            pass
 
     def _scrollable(self, tab: ttk.Frame) -> ttk.Frame:
         """A vertically scrolling area inside ``tab``: the Align controls are taller than a small window."""
@@ -661,7 +704,7 @@ class StitchGui(tk.Tk):
             text = self._notebook.tab(self._notebook.select(), "text")
         except tk.TclError:
             return
-        self._left.configure(width=560 if text == "Worklist" else 360)
+        # (the left panel's width is set by the draggable divider now, not per tab)
 
     def browse_a(self) -> None:
         p = filedialog.askdirectory(title="Select TOP (A) series folder")

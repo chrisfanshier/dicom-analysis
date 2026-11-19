@@ -105,9 +105,10 @@ class WorklistPanel(ttk.Frame):
         top = ttk.Frame(self)
         top.grid(row=0, column=0, sticky="ew")
         top.columnconfigure(0, weight=1)
-        ttk.Label(top, textvariable=self.release_var, font=("", 8), wraplength=420).grid(
-            row=0, column=0, sticky="w"
-        )
+        rel = ttk.Label(top, textvariable=self.release_var, font=("", 8), wraplength=300)
+        rel.grid(row=0, column=0, sticky="ew")
+        rel._own_wrap = True  # wraps to the room beside the buttons (the panel-wide re-wrap skips it)
+        rel.bind("<Configure>", lambda e: rel.configure(wraplength=max(120, e.width - 6)))
         ttk.Button(top, text="Release…", width=9, command=self.choose_release).grid(row=0, column=1)
         ttk.Button(top, text="Reload", width=7, command=self.reload).grid(row=0, column=2, padx=(4, 0))
         ttk.Button(top, text="Re-check exports", command=self.recheck_exports).grid(row=0, column=3, padx=(4, 0))
